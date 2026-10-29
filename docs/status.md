@@ -339,3 +339,75 @@ loads the XBE, creates the D3D12 device and swap chain and renders the startup
 movie (`out/shots/wine_a.png`), with 0 shader-compilation failures and 0
 errors in a 60 s bounded run. That is the whole of the evidence for that
 binary.
+
+## Update 2026-10-29: Windows play-testing, rendering fixes and PC features
+
+Recorded on a Windows 11 x64 machine (D3D12), which now builds the port natively (LLVM 23.1.4 in `C:\Program Files\LLVM`, VS
+2022 Build Tools). The SDK changes are five commits on `sims2-port-fixes` after
+`adc40ab`, not yet in the SDK's own repository: they are kept in
+`patches/sdk/` for `git -C sdk am ../patches/sdk/*.patch`, and the `sdk`
+submodule stays at `adc40ab` until they are pushed there. Every defect below
+was confirmed fixed in play by the owner unless it says otherwise.
+
+### Defect 5: easel paintings black
+
+The canvas (one 128x128 `A1R5G5B5` texture, `0x8000` in every texel in guest
+memory) is filled by the title from 16-bit 128x128 render targets of the generic
+render-to-texture class (`sub_00214E70`, locked from `0x214FEC`/`0x2150B8`).
+Their read-backs were refused: `read-back of 822A7000 refused, its 128x128
+target needs 65536 bytes, the surface has 32768`. Read-back only knew 32-bit
+surfaces. Fixed in both backends: targets carry the guest format, pitch and
+bytes a pixel, and `Sync`/`DeliverLate` pack into R5G6B5, A1R5G5B5, X1R5G5B5
+and A4R4G4B4. Found with an F3 capture and the new `XBE_LOG` switch.
+
+### Defect 6: pink fringe round self portraits
+
+The portrait target is cleared to a magenta key and keyed after read-back. At
+render scale the read-back's shrink blended edge pixels with the key, so they
+missed it. 16-bit read-back targets, and the depth drawn with them, are now made
+at console size (`Target::unscaled`).
+
+### Defect 7: hard dark bands during conversations
+
+The conversation blur (`sub_001F56F0` builds 320/160/80/40 levels,
+`sub_001F5B50` composites them) lost the top 16 rows of every level: the host's
+`D3DDevice_SetRenderTarget` reset the viewport but kept the frame's
+640x448-picture scissor (rows 16-463), which clipped each off-screen pass in its
+own pixels. The probe (`XBE_CAPTURE_PROBE`) plus the per-level row measurements
+in the capture pinned it. `SetRenderTarget` now clears the scissors, as
+`SetViewport` does.
+
+### PC features (port side, `src/`)
+
+- `src/game/options.cpp` hooks the developer-option registration
+  `sub_0002CAC0` (about 80 options, type 2 = an on/off byte the registrar never
+  writes). `src/common/game_options.cpp` keeps a curated set in
+  `settings.toml`: `skip_startup_movies`, `enable_all_player_cheats` (the
+  cheat gnome with every cheat, no button codes), `god_mode`, unlocks, free
+  items, motive values. `force_rain` is type 4, untraced, and left out. The F1
+  panel shows them and every registered switch with the game's own text.
+- `src/common/quit_prompt.cpp`: hold L3 + R3 + Start for 1.5 s, A quits
+  (`WM_CLOSE` / `SDL_EVENT_QUIT`), B cancels; the game sees a neutral pad
+  while the prompt is up.
+- `dpad_repeat_percent` (F1, default 200) scales the pad auto-repeat hook in
+  `src/game/hooks.cpp`: at 60 Hz the stock counts doubled menu steps.
+- Captures list each stage's filter and address modes; `out/build/release/
+  capture.bat` launches with `XBE_LOG`, `XBE_PERF` and the capture on.
+
+### Texture packs and save backups (SDK)
+
+- `gpu/replace.cpp`: each uploaded texture is keyed by a hash of its first level's
+  guest bytes, format, size and palette. `textures/<key>.png` beside the
+  executable replaces it at any size, with generated mips; `XBE_TEXTURE_DUMP=1`
+  writes every replaceable texture once to `textures_dump/<key>.png` (DXT1/3/5
+  decoded). Rect textures only take same-size replacements; cube, volume and video
+  textures are never keyed. Verified on Windows: a dump run and a 2x replacement
+  of the plumbob sheet (`A27C80105F9EB5A8`) loaded and uploaded.
+- `kernel/files.cpp`: before a save folder's file is written, created or deleted,
+  the folder is copied to `hdd/backups/<title>/<save>/<time>/` (newest five, at
+  most one a minute). Boot does not write saves, so it is not yet seen firing in
+  play.
+
+Not yet run on Linux: the Vulkan side of defects 5 and 6 passes a syntax-only
+compile of `vulkan.cpp` on its Linux path. Still open: ambient sound lost after
+travelling to a third location (not yet reproducible).

@@ -1,2 +1,4 @@
 * text=auto
 *.bat text eol=crlf
+# SDK patches are applied with git am: kept byte for byte
+patches/**/*.patch -text

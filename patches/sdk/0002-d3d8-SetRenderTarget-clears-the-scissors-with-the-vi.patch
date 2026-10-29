@@ -1,0 +1,39 @@
+From 5badb9cc558fc4c32eb0516859c648f3021b0153 Mon Sep 17 00:00:00 2001
+From: SpicyEggSalad <177426835+SpicyEggSalad@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 07:36:25 +0000
+Subject: [PATCH 2/5] d3d8: SetRenderTarget clears the scissors with the
+ viewport
+
+SetRenderTarget reset the viewport to the whole new target but kept the
+scissor rectangles, unlike SetViewport. A title that scissors its frame
+then clipped every off-screen pass in that pass's own pixels: Sims 2
+scissors its frame to the 640x448 picture (rows 16-463), so each level
+of the conversation blur lost its top 16 rows and the composite laid
+those black rows over the top of the screen as hard dark bands.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/xdk/d3d8.cpp | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/xdk/d3d8.cpp b/runtime/xdk/d3d8.cpp
+index ad0b522..7e3a038 100644
+--- a/runtime/xdk/d3d8.cpp
++++ b/runtime/xdk/d3d8.cpp
+@@ -704,10 +704,15 @@ HLE_STDCALL(D3DDevice_SetRenderTarget, 2) {
+     Set(g_state.rt, SurfaceOf(rt));
+     Set(g_state.zs, SurfaceOf(zs));
+     UpdateSuperSample();
+-    // SetRenderTarget resets the viewport to the whole target
++    // SetRenderTarget resets the viewport to the whole target, and with it the scissors, as SetViewport does above.
++    // Kept, the frame's scissors clipped every off-screen pass in its own pixels: Sims 2 scissors its frame to the
++    // 640 x 448 picture (rows 16 to 463, sub_001FD6D0), so the conversation blur's four levels (sub_001F56F0) lost
++    // their top 16 rows each, and the composite (sub_001F5B50) laid those black rows over the top of the screen as
++    // hard dark bands
+     uint32_t w, h;
+     gpu::SurfaceSize(g_state.rt, w, h);
+     Set(g_state.viewport, {0, 0, w, h, 0.0f, 1.0f});
++    Set(g_state.scissor_count, 0);
+     UpdateViewportConstants();
+     return 0;
+ }

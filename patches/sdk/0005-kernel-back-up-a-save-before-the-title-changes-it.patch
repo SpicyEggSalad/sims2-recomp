@@ -1,0 +1,123 @@
+From 8d1f05098e7ccdbe63ea6721bdfa930bc333b766 Mon Sep 17 00:00:00 2001
+From: SpicyEggSalad <177426835+SpicyEggSalad@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 07:48:41 +0000
+Subject: [PATCH 5/5] kernel: back up a save before the title changes it
+
+Before a file in a save folder (UDATA/<title>/<save>/) is opened for
+writing, created, or marked for deletion, the whole folder is copied to
+<hdd>/backups/<title>/<save>/<local time>/, which no partition maps. A
+save's files only make sense together, so the copy is the folder, at
+most once a minute per save, keeping the newest five. Files beside the
+save folders (TitleMeta.xbx and friends) are not saves and never copied.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/kernel/files.cpp | 60 +++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 59 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/kernel/files.cpp b/runtime/kernel/files.cpp
+index 6ba6ef6..1ffd8f1 100644
+--- a/runtime/kernel/files.cpp
++++ b/runtime/kernel/files.cpp
+@@ -2,6 +2,7 @@
+ #include <cctype>
+ #include <chrono>
+ #include <cstdio>
++#include <ctime>
+ #include <filesystem>
+ #include <fstream>
+ #include <map>
+@@ -26,6 +27,58 @@ std::string Upper(std::string s) {
+     return s;
+ }
+ 
++// Save backups. Before a title changes a save - a file in its folder opened for writing or created, or marked for
++// deletion - the whole save folder is copied to <hdd>/backups/<title>/<save>/<local time>/, a folder no partition
++// maps, so the title never sees it. A save is UDATA/<title id>/<save folder>/ on the user data partition and its
++// files only make sense together, so the copy is the whole folder; files beside the save folders (TitleMeta.xbx and
++// friends) are not saves. One save writes several files, so a folder is copied at most once a minute, and the
++// newest kBackupsKept copies of each save are kept.
++constexpr size_t kBackupsKept = 5;
++constexpr auto kBackupGap = std::chrono::seconds(60);
++
++void BackupSave(const fs::path& host) {
++    std::vector<fs::path> parts(host.begin(), host.end());
++    size_t udata = parts.size();
++    for (size_t i = 1; i < parts.size(); i++)
++        if (Upper(parts[i].string()) == "UDATA") udata = i;
++    // .../<hdd>/<partition>/UDATA/<title>/<save>/<file>
++    if (udata < 2 || parts.size() < udata + 4) return;
++    fs::path hdd, save;
++    for (size_t i = 0; i < udata - 1; i++) hdd /= parts[i];
++    for (size_t i = 0; i < udata + 3; i++) save /= parts[i];
++    std::error_code ec;
++    if (!fs::is_directory(save, ec) || fs::is_empty(save, ec)) return;
++
++    static std::mutex lock;
++    static std::map<std::string, std::chrono::steady_clock::time_point> last;
++    std::lock_guard<std::mutex> guard(lock);
++    auto now = std::chrono::steady_clock::now();
++    auto it = last.find(save.string());
++    if (it != last.end() && now - it->second < kBackupGap) return;
++    last[save.string()] = now;
++
++    fs::path dir = hdd / "backups" / parts[udata + 1] / parts[udata + 2];
++    std::time_t t = std::time(nullptr);
++    char stamp[32];
++    std::strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", std::localtime(&t));
++    fs::path dest = dir / stamp;
++    for (int n = 2; fs::exists(dest, ec); n++) dest = dir / (std::string(stamp) + "-" + std::to_string(n));
++    fs::create_directories(dest, ec);
++    fs::copy(save, dest, fs::copy_options::recursive, ec);
++    if (ec) {
++        LOGE("save backup: copying %s failed: %s", save.string().c_str(), ec.message().c_str());
++        return;
++    }
++    LOGR("save backup: %s -> %s", save.string().c_str(), dest.string().c_str());
++
++    // the oldest go: the names are times, so name order is age order
++    std::vector<fs::path> kept;
++    for (const auto& e : fs::directory_iterator(dir, ec))
++        if (e.is_directory(ec)) kept.push_back(e.path());
++    std::sort(kept.begin(), kept.end());
++    for (size_t i = 0; i + kBackupsKept < kept.size(); i++) fs::remove_all(kept[i], ec);
++}
++
+ std::string Normalize(std::string p) {
+     std::replace(p.begin(), p.end(), '/', '\\');
+     std::string out;
+@@ -325,7 +378,8 @@ bool ReadGameFile(const std::string& xbox_path, std::vector<uint8_t>& out) {
+ 
+ KERNEL_EXPORT(190, NtCreateFile, 9) {
+     uint32_t handle_out = a[0], access = a[1], attrs = a[2], iosb = a[3], disposition = a[7], options = a[8];
+-    (void)access;
++    // GENERIC_WRITE, GENERIC_ALL, DELETE, FILE_WRITE_DATA, FILE_APPEND_DATA: what changes a file in place
++    constexpr uint32_t kWriteAccess = 0x40000000 | 0x10000000 | 0x00010000 | 0x2 | 0x4;
+     uint32_t root;
+     std::string name = ObjectName(attrs, &root);
+     Target t = Resolve(name, root);
+@@ -408,6 +462,8 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
+         IoStatus(iosb, kObjectPathNotFound, 0);
+         return kObjectPathNotFound;
+     }
++    // created, truncated, written or to be deleted: a save is copied aside first
++    if (std::string(mode) == "w+b" || (access & kWriteAccess) || (options & 0x1000)) BackupSave(host);
+     FILE* fp = std::fopen(host.c_str(), mode);
+     if (!fp && std::string(mode) == "r+b") fp = std::fopen(host.c_str(), "rb");  // read only media
+     if (!fp) {
+@@ -570,6 +626,7 @@ KERNEL_EXPORT(226, NtSetInformationFile, 5) {
+             break;
+         case 13:  // disposition
+             f->delete_on_close = G<uint8_t>(in) != 0;
++            if (f->delete_on_close) BackupSave(f->host);
+             break;
+         case 10: {  // rename: ReplaceIfExists, RootDirectory, FileName (ANSI_STRING inline)
+             uint32_t root = R32(in + 4);
+@@ -717,6 +774,7 @@ KERNEL_EXPORT(210, NtQueryFullAttributesFile, 2) {
+ KERNEL_EXPORT(195, NtDeleteFile, 1) {
+     std::string host = ResolvePath(ReadAnsiString(R32(a[0] + 4)), R32(a[0]));
+     std::error_code ec;
++    if (!host.empty()) BackupSave(host);
+     if (host.empty() || !fs::remove(host, ec)) return kObjectNameNotFound;
+     return kSuccess;
+ }
