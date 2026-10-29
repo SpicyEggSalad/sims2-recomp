@@ -31,6 +31,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "common/game_options.h"
 #include "cpu/x86_ops.h"
 #include "xdk/hle.h"
 
@@ -120,9 +121,14 @@ X86_FUNC(sub_001C2400) {
 // Tied to calls, a 144 fps game therefore repeats 2.4x too fast. The counts are rescaled to the
 // frame that really passed for the duration of the call and restored after: the scale is
 // 1/(60 * dt), which does not depend on how many polls a frame makes, only on the polls being
-// frame-driven - the console made the same number of calls per frame, so console timing is
-// preserved at any frame rate. Only the two reload bytes are scaled; the timer bytes at
-// pad+0x1B8 are the original's own state and keep the scaled reload they were given.
+// frame-driven. Only the two reload bytes are scaled; the timer bytes at pad+0x1B8 are the
+// original's own state and keep the scaled reload they were given.
+//
+// What rate the console really ran these counts at is not settled: the title asks CreateDevice for
+// present interval 2 (30 Hz) and Reset for interval 1, and both poll paths count down. At 60 Hz the
+// stock 10/3 counts gave a 167 ms delay and 50 ms repeat, fast enough to double a menu step on a
+// slightly long press, so the scale also carries the player's dpad_repeat_percent
+// (common/game_options.h): 200, the default, is the 30 Hz reading, 333 ms and 100 ms.
 X86_FUNC(__imp__sub_001BCA50);
 X86_FUNC(sub_001BCA50) {
     if (HookOff("SIMS2_NO_REPEAT")) { __imp__sub_001BCA50(ctx, base); return; }
@@ -130,7 +136,8 @@ X86_FUNC(sub_001BCA50) {
     // [pad+0x1D8] is only a valid pad on the paths the polls take; anything else runs untouched
     // rather than writing two bytes into low guest memory.
     if (pad < 0x10000u) { __imp__sub_001BCA50(ctx, base); return; }
-    const double scale = 1.0 / (60.0 * g_dt.load(std::memory_order_relaxed));
+    const double slow = std::clamp(gameopt::RepeatPercent(), gameopt::kRepeatMin, gameopt::kRepeatMax) / 100.0;
+    const double scale = slow / (60.0 * g_dt.load(std::memory_order_relaxed));
     const uint8_t delay = X86_MEM8(pad + 0x1D8u), rate = X86_MEM8(pad + 0x1D9u);
     X86_MEM8(pad + 0x1D8u) = uint8_t(std::clamp(int(delay * scale + 0.5), 1, 255));
     X86_MEM8(pad + 0x1D9u) = uint8_t(std::clamp(int(rate * scale + 0.5), 1, 255));

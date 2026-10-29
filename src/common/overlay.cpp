@@ -4,7 +4,9 @@
 // window size or a pad exists.
 #include "common/overlay.h"
 
+#include "common/game_options.h"
 #include "common/input_kbm.h"
+#include "common/quit_prompt.h"
 
 #include <algorithm>
 #include <atomic>
@@ -488,6 +490,41 @@ void DrawQuality() {
     Note("Forced only where the game already filters across mip levels.");
 }
 
+// the game's own developer options (game_options.cpp): live, unlike the draft above, since the game reads them
+// where it needs them; Save keeps the named ones in the settings file
+void DrawGameRows(gameopt::Group group) {
+    size_t n = 0;
+    gameopt::Managed* list = gameopt::Curated(group, n);
+    for (size_t i = 0; i < n; i++) {
+        gameopt::Managed& m = list[i];
+        Row(m.label);
+        bool on = m.on;
+        char id[64];
+        std::snprintf(id, sizeof id, "##%s", m.key);
+        if (ImGui::Checkbox(id, &on)) gameopt::Set(m, on);
+        if (m.note[0]) Note(m.note);
+        if (m.restart) Note("Read once at boot: Save, and it applies from the next start.");
+    }
+}
+
+// every on/off switch the game registered, with the game's own description: for this session only
+void DrawAllOptions() {
+    const size_t n = gameopt::Count();
+    char header[64];
+    std::snprintf(header, sizeof header, "All developer options (%zu)###sims2_devopts", n);
+    if (!ImGui::CollapsingHeader(header)) return;
+    Note("The game's own debug switches, as it registered them. Untested on this port, and some may break a "
+         "save or crash: changes here last for this session only, and only the ones above are saved.");
+    ImGui::BeginChild("##devopts", {0.0f, 260.0f * g_ui_scale}, ImGuiChildFlags_Border);
+    for (size_t i = 0; i < n; i++) {
+        const gameopt::Registered r = gameopt::At(i);
+        bool on = *r.var != 0;
+        if (ImGui::Checkbox(r.name, &on)) *r.var = on ? 1 : 0;
+        if (r.desc[0] && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", r.desc);
+    }
+    ImGui::EndChild();
+}
+
 void DrawSettings() {
     const ImGuiIO& io = ImGui::GetIO();
     // centred, auto fitting its height, and resizable once it is up
@@ -514,6 +551,28 @@ void DrawSettings() {
         DrawQuality();
         ImGui::EndTable();
     }
+    ImGui::SeparatorText("Game");
+    if (BeginRows("##startup_rows", label_width)) {
+        DrawGameRows(gameopt::Group::Startup);
+        Row("D-pad repeat delay");
+        int repeat = int(gameopt::RepeatPercent());
+        if (ImGui::SliderInt("##repeat", &repeat, int(gameopt::kRepeatMin), int(gameopt::kRepeatMax), "%d %%",
+                             ImGuiSliderFlags_AlwaysClamp))
+            gameopt::RepeatPercent() = uint32_t((repeat + 5) / 10 * 10);
+        char text[96];
+        std::snprintf(text, sizeof text, "A held button repeats after %d ms, then every %d ms. Higher is slower.",
+                      10 * 1000 * repeat / 6000, 3 * 1000 * repeat / 6000);
+        Note(text);
+        ImGui::EndTable();
+    }
+    ImGui::SeparatorText("Cheats");
+    Note("These take effect at once; Save keeps them for the next start. They come from the game's own "
+         "developer options, so their effects beyond the game's description are untested on this port.");
+    if (BeginRows("##cheat_rows", label_width)) {
+        DrawGameRows(gameopt::Group::Cheats);
+        ImGui::EndTable();
+    }
+    DrawAllOptions();
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -559,6 +618,7 @@ void Draw(double fps) {
     if (io.DisplaySize.x < 1.0f || io.DisplaySize.y < 1.0f) return;
     ScaleStyle(io);
     Sample(io.DeltaTime);
+    gameopt::Hold();
 
     // the window thread feeds every key message to ImGui under the same lock (main.cpp WndProc),
     // so these land while the game has focus. F3 is the frame capture's
@@ -586,6 +646,7 @@ void Draw(double fps) {
     if (!g_settings_open && io.MouseWheel != 0.0f) kbm::NoteWheel(int(std::lround(io.MouseWheel)));
 #endif
 
+    quitprompt::Draw();  // up only while the controller combination opened it
     if (!g_perf_open && !g_settings_open) return;  // closed: the overlay draws nothing else
     if (g_perf_open) DrawPerf(fps);
     if (g_settings_open) DrawSettings();
