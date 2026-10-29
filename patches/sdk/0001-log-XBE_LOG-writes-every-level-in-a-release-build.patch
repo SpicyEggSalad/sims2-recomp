@@ -1,0 +1,35 @@
+From a4d37486f108ecab7237588c4e21310839e51386 Mon Sep 17 00:00:00 2001
+From: SpicyEggSalad <177426835+SpicyEggSalad@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 07:36:25 +0000
+Subject: [PATCH 1/5] log: XBE_LOG writes every level in a release build
+
+Release builds keep Report and Error lines only, which hides the info lines
+that diagnose rendering and audio problems (refused read-backs, missing
+files, lock call sites). With XBE_LOG set, a release build writes every
+level into its usual log, as a verbose build does.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/core/log.cpp | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/core/log.cpp b/runtime/core/log.cpp
+index 7e6507d..d512361 100644
+--- a/runtime/core/log.cpp
++++ b/runtime/core/log.cpp
+@@ -51,8 +51,14 @@ void Init(const std::string& dir, const std::string& prefix, bool append) {
+ 
+ const std::string& Path() { return g_path; }
+ 
++// XBE_LOG set: a release build writes every level, as a verbose one does, into its usual log
++static bool AllLevels() {
++    static const bool on = kVerbose || std::getenv("XBE_LOG") != nullptr;
++    return on;
++}
++
+ void Write(Level lv, const char* fmt, ...) {
+-    if (!kVerbose && lv < Level::Error) return;
++    if (!AllLevels() && lv < Level::Error) return;
+     char msg[4096];
+     va_list ap;
+     va_start(ap, fmt);

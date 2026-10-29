@@ -1,0 +1,564 @@
+From 71a4c67de04283eca6da75e4cb838de319a5d8f6 Mon Sep 17 00:00:00 2001
+From: SpicyEggSalad <177426835+SpicyEggSalad@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 07:48:41 +0000
+Subject: [PATCH 4/5] gpu: texture replacement packs and a texture dump
+
+Every uploaded texture gets a key: a hash of its first level's guest bytes
+with its format, size and palette. textures/<key>.png anywhere under the
+executable's folder replaces it at any size, with a mip chain built from
+it (WIC on Windows, the splash PNG decoder elsewhere). XBE_TEXTURE_DUMP
+writes each replaceable texture once to textures_dump/<key>.png (DXT1/3/5
+and every format DecodeLevel knows, as uncompressed RGBA PNGs), so a pack
+starts from the title's own pictures. Rect textures only take a
+replacement of their own size, being sampled in texels; cube maps,
+volumes and video frames are never keyed. Both backends.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/gpu/d3d12.cpp   |  50 ++++++-
+ runtime/gpu/replace.cpp | 324 ++++++++++++++++++++++++++++++++++++++++
+ runtime/gpu/replace.h   |  36 +++++
+ runtime/gpu/vulkan.cpp  |  39 ++++-
+ 4 files changed, 447 insertions(+), 2 deletions(-)
+ create mode 100644 runtime/gpu/replace.cpp
+ create mode 100644 runtime/gpu/replace.h
+
+diff --git a/runtime/gpu/d3d12.cpp b/runtime/gpu/d3d12.cpp
+index a1d1900..2d8e928 100644
+--- a/runtime/gpu/d3d12.cpp
++++ b/runtime/gpu/d3d12.cpp
+@@ -33,6 +33,7 @@
+ #include "core/log.h"
+ #include "gpu/backend.h"
+ #include "gpu/ext.h"
++#include "gpu/replace.h"
+ #include "gpu/shaders.h"
+ #include "gpu/texture.h"
+ #include "gpu/vertex.h"
+@@ -486,6 +487,7 @@ struct Tex {
+     uint64_t frame = 0;
+     uint64_t palette = 0;  // hash of the colours a P8 texture was decoded with
+     uint8_t flags = 0;  // Extension::Decoded's
++    uint64_t replaced = 0;  // the replace::Key whose picture it holds instead of the guest bytes, 0 for none
+ };
+ 
+ struct PsoKey {
+@@ -670,6 +672,8 @@ private:
+     void UploadTexture(Tex& tx, const TextureDesc& d, const FormatInfo& fi, const uint8_t* p, const uint32_t* colours,
+                        bool same);
+     void UploadTextureLevel(Tex& tx, uint32_t f, uint32_t l, const std::vector<uint8_t>& px, uint32_t pitch);
++    // a replacement picture (gpu/replace.h) into tx, made again at its size; false when it could not be made
++    bool UploadReplacement(Tex& tx, const replace::Image& img, uint64_t key);
+     void EnsurePixelShader(const PixelKey& pk, DrawShaders& sh);
+     void BuildPipelineKey(const State& s, const Assembled& a, uint64_t vh, uint64_t ph, PsoKey& k);
+     void KeyDepthStencil(const State& s, const Assembled& a, PsoKey& k);
+@@ -1937,6 +1941,28 @@ void D3D12Backend::UploadTexture(Tex& tx, const TextureDesc& d, const FormatInfo
+     Transition(tx.res.Get(), st, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+ }
+ 
++bool D3D12Backend::UploadReplacement(Tex& tx, const replace::Image& img, uint64_t key) {
++    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
++    D3D12_RESOURCE_DESC td = Texture2DDesc(DXGI_FORMAT_B8G8R8A8_UNORM, img.w, img.h);
++    td.MipLevels = UINT16(img.levels.size());
++    ComPtr<ID3D12Resource> res;
++    if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
++                                             IID_PPV_ARGS(&res)))) {
++        LOG_FIRST(8, "d3d12: %ux%u replacement texture not made", img.w, img.h);
++        return false;
++    }
++    if (tx.res) CurrentFrame().garbage.push_back(tx.res);
++    tx.res = res;
++    tx.fmt = DXGI_FORMAT_B8G8R8A8_UNORM;
++    tx.levels = uint32_t(img.levels.size());
++    tx.flags = 0;
++    tx.replaced = key;
++    for (uint32_t l = 0; l < tx.levels; l++) UploadTextureLevel(tx, 0, l, img.levels[l], std::max(img.w >> l, 1u) * 4);
++    D3D12_RESOURCE_STATES st = D3D12_RESOURCE_STATE_COPY_DEST;
++    Transition(tx.res.Get(), st, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
++    return true;
++}
++
+ void FillTextureView(const Tex& tx, const TextureDesc& d, D3D12_SHADER_RESOURCE_VIEW_DESC& sv) {
+     sv.Format = tx.fmt;
+     if (d.cube) {
+@@ -1996,7 +2022,29 @@ ID3D12Resource* D3D12Backend::BindGuestTexture(const State& s, int stage, const
+             g_perf.texups++;
+             g_perf.texup_bytes += total;
+             tx.sig = sig;
+-            UploadTexture(tx, d, fi, p, palette.va ? palette.colours : nullptr, same);
++            const uint32_t* colours = palette.va ? palette.colours : nullptr;
++            // texture packs (gpu/replace.h): the title's bytes pick a picture, or are dumped to make one
++            std::shared_ptr<const replace::Image> img;
++            uint64_t rkey = 0;
++            if (replace::Active() && replace::Eligible(d)) {
++                rkey = replace::Key(d, p, palette.hash);
++                replace::Dump(rkey, d, p, colours);
++                img = replace::Find(rkey, d);
++            }
++            if (img && (tx.replaced == rkey || UploadReplacement(tx, *img, rkey))) {
++                // the picture stays as long as the title's bytes do
++            } else {
++                if (tx.replaced) {
++                    // the title put other bytes there: the guest's own texture again, at its own size
++                    const uint64_t frame = tx.frame, pal = tx.palette;
++                    if (!CreateTexture(tx, d, fi, key)) return nullptr;
++                    tx.frame = frame;
++                    tx.palette = pal;
++                    tx.sig = sig;
++                    same = false;
++                }
++                UploadTexture(tx, d, fi, p, colours, same);
++            }
+         }
+     }
+     FillTextureView(tx, d, stages.sv[stage]);
+diff --git a/runtime/gpu/replace.cpp b/runtime/gpu/replace.cpp
+new file mode 100644
+index 0000000..aae9f47
+--- /dev/null
++++ b/runtime/gpu/replace.cpp
+@@ -0,0 +1,324 @@
++#include "gpu/replace.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <mutex>
++#include <unordered_map>
++#include <unordered_set>
++
++#include "app/app.h"
++#include "core/log.h"
++#include "gpu/shaders.h"  // Hash
++
++#if defined(_WIN32)
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#include <wincodec.h>
++#include <wrl/client.h>
++#else
++#include "app/image_decode.h"
++#endif
++
++namespace fs = std::filesystem;
++
++namespace gpu::replace {
++
++namespace {
++
++constexpr uint32_t kFmtYuy2 = 0x24, kFmtUyvy = 0x25;  // video frames: new bytes every frame, never keyed
++constexpr uint32_t kFmtDxt1 = 0x0C, kFmtDxt3 = 0x0E, kFmtDxt5 = 0x0F;
++
++struct State {
++    bool dump = false;
++    fs::path dump_dir;
++    std::unordered_map<uint64_t, fs::path> files;                         // key to its PNG under textures/
++    std::unordered_map<uint64_t, std::shared_ptr<const Image>> decoded;  // null: tried and unusable
++    std::unordered_set<uint64_t> dumped;
++};
++
++// the textures/ folder is read once, at the first texture upload
++State& Get() {
++    static State s;
++    static std::once_flag once;
++    std::call_once(once, [] {
++        fs::path dir = app::ExeDir() / "textures";
++        std::error_code ec;
++        if (fs::is_directory(dir, ec)) {
++            for (auto it = fs::recursive_directory_iterator(dir, ec); it != fs::recursive_directory_iterator();
++                 it.increment(ec)) {
++                if (ec) break;
++                const fs::path& p = it->path();
++                std::string ext = p.extension().string();
++                std::transform(ext.begin(), ext.end(), ext.begin(), [](char c) { return char(std::tolower(uint8_t(c))); });
++                std::string stem = p.stem().string();
++                if (ext != ".png" || stem.size() != 16) continue;
++                char* end = nullptr;
++                uint64_t key = std::strtoull(stem.c_str(), &end, 16);
++                if (end == stem.c_str() + 16) s.files[key] = p;
++            }
++            LOGR("textures: %zu replacement(s) under %s", s.files.size(), dir.string().c_str());
++        }
++        if (const char* v = std::getenv("XBE_TEXTURE_DUMP"); v && *v && std::strcmp(v, "0") != 0) {
++            s.dump = true;
++            s.dump_dir = app::ExeDir() / "textures_dump";
++            fs::create_directories(s.dump_dir, ec);
++            LOGR("textures: dumping every replaceable texture to %s", s.dump_dir.string().c_str());
++        }
++    });
++    return s;
++}
++
++// BGRA, straight alpha
++bool LoadPng(const fs::path& path, std::vector<uint8_t>& bgra, uint32_t& w, uint32_t& h) {
++#if defined(_WIN32)
++    using Microsoft::WRL::ComPtr;
++    CoInitializeEx(nullptr, COINIT_MULTITHREADED);  // already initialised another way is fine
++    ComPtr<IWICImagingFactory> wic;
++    ComPtr<IWICBitmapDecoder> decoder;
++    ComPtr<IWICBitmapFrameDecode> frame;
++    ComPtr<IWICFormatConverter> converter;
++    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic));
++    if (SUCCEEDED(hr))
++        hr = wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &decoder);
++    if (SUCCEEDED(hr)) hr = decoder->GetFrame(0, &frame);
++    if (SUCCEEDED(hr)) hr = wic->CreateFormatConverter(&converter);
++    if (SUCCEEDED(hr))
++        hr = converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, nullptr, 0,
++                                   WICBitmapPaletteTypeCustom);
++    UINT uw = 0, uh = 0;
++    if (SUCCEEDED(hr)) hr = converter->GetSize(&uw, &uh);
++    if (FAILED(hr) || !uw || !uh) return false;
++    w = uw;
++    h = uh;
++    bgra.resize(size_t(w) * h * 4);
++    return SUCCEEDED(converter->CopyPixels(nullptr, w * 4, UINT(bgra.size()), bgra.data()));
++#else
++    if (!app::DecodePng(path, bgra, w, h)) return false;
++    for (size_t i = 0; i + 3 < bgra.size(); i += 4) std::swap(bgra[i], bgra[i + 2]);  // RGBA to BGRA
++    return true;
++#endif
++}
++
++// each next level a 2x2 box of the one before, down to 1 x 1
++void MakeMips(Image& img) {
++    uint32_t w = img.w, h = img.h;
++    while (w > 1 || h > 1) {
++        const std::vector<uint8_t>& src = img.levels.back();
++        uint32_t nw = std::max(w / 2, 1u), nh = std::max(h / 2, 1u);
++        std::vector<uint8_t> dst(size_t(nw) * nh * 4);
++        for (uint32_t y = 0; y < nh; y++)
++            for (uint32_t x = 0; x < nw; x++)
++                for (int c = 0; c < 4; c++) {
++                    uint32_t x0 = std::min(x * 2, w - 1), x1 = std::min(x * 2 + 1, w - 1);
++                    uint32_t y0 = std::min(y * 2, h - 1), y1 = std::min(y * 2 + 1, h - 1);
++                    uint32_t sum = src[(size_t(y0) * w + x0) * 4 + c] + src[(size_t(y0) * w + x1) * 4 + c] +
++                                   src[(size_t(y1) * w + x0) * 4 + c] + src[(size_t(y1) * w + x1) * 4 + c];
++                    dst[(size_t(y) * nw + x) * 4 + c] = uint8_t((sum + 2) / 4);
++                }
++        img.levels.push_back(std::move(dst));
++        w = nw;
++        h = nh;
++    }
++}
++
++uint8_t Expand5(uint32_t v) { return uint8_t((v << 3) | (v >> 2)); }
++uint8_t Expand6(uint32_t v) { return uint8_t((v << 2) | (v >> 4)); }
++
++// one 4x4 DXT colour block into 16 BGRA pixels; four colours always, unless a DXT1 block asks for three
++void ColourBlock(const uint8_t* b, bool dxt1, uint8_t out[16][4]) {
++    uint16_t c0 = uint16_t(b[0] | b[1] << 8), c1 = uint16_t(b[2] | b[3] << 8);
++    uint8_t p[4][4];
++    auto unpack = [](uint16_t c, uint8_t* o) {
++        o[0] = Expand5(c & 31);
++        o[1] = Expand6((c >> 5) & 63);
++        o[2] = Expand5(c >> 11);
++        o[3] = 255;
++    };
++    unpack(c0, p[0]);
++    unpack(c1, p[1]);
++    for (int i = 0; i < 3; i++) {
++        if (!dxt1 || c0 > c1) {
++            p[2][i] = uint8_t((2 * p[0][i] + p[1][i] + 1) / 3);
++            p[3][i] = uint8_t((p[0][i] + 2 * p[1][i] + 1) / 3);
++        } else {
++            p[2][i] = uint8_t((p[0][i] + p[1][i]) / 2);
++            p[3][i] = 0;
++        }
++    }
++    p[2][3] = 255;
++    p[3][3] = !dxt1 || c0 > c1 ? 255 : 0;
++    uint32_t idx = uint32_t(b[4]) | uint32_t(b[5]) << 8 | uint32_t(b[6]) << 16 | uint32_t(b[7]) << 24;
++    for (int i = 0; i < 16; i++) std::memcpy(out[i], p[(idx >> (2 * i)) & 3], 4);
++}
++
++// DXT1, DXT3 or DXT5 blocks, rows of blocks in memory, into BGRA w x h
++void DecodeDxt(uint32_t fmt, const uint8_t* src, uint32_t w, uint32_t h, std::vector<uint8_t>& out) {
++    const uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4, bytes = fmt == kFmtDxt1 ? 8 : 16;
++    out.assign(size_t(w) * h * 4, 0);
++    for (uint32_t by = 0; by < bh; by++)
++        for (uint32_t bx = 0; bx < bw; bx++) {
++            const uint8_t* b = src + (size_t(by) * bw + bx) * bytes;
++            uint8_t px[16][4];
++            ColourBlock(fmt == kFmtDxt1 ? b : b + 8, fmt == kFmtDxt1, px);
++            if (fmt == kFmtDxt3) {
++                for (int i = 0; i < 16; i++) px[i][3] = uint8_t(((b[i / 2] >> (4 * (i & 1))) & 15) * 17);
++            } else if (fmt == kFmtDxt5) {
++                uint32_t a[8] = {b[0], b[1]};
++                for (int i = 2; i < 8; i++)
++                    a[i] = a[0] > a[1] ? ((8 - i) * a[0] + (i - 1) * a[1]) / 7
++                                       : i < 6 ? ((6 - i) * a[0] + (i - 1) * a[1]) / 5 : (i == 6 ? 0 : 255);
++                uint64_t bits = 0;
++                for (int i = 0; i < 6; i++) bits |= uint64_t(b[2 + i]) << (8 * i);
++                for (int i = 0; i < 16; i++) px[i][3] = uint8_t(a[(bits >> (3 * i)) & 7]);
++            }
++            for (int i = 0; i < 16; i++) {
++                uint32_t x = bx * 4 + uint32_t(i & 3), y = by * 4 + uint32_t(i >> 2);
++                if (x < w && y < h) std::memcpy(&out[(size_t(y) * w + x) * 4], px[i], 4);
++            }
++        }
++}
++
++uint32_t Crc(const uint8_t* p, size_t n, uint32_t c = 0xFFFFFFFFu) {
++    static uint32_t table[256] = {};
++    static std::once_flag once;
++    std::call_once(once, [] {
++        for (uint32_t i = 0; i < 256; i++) {
++            uint32_t v = i;
++            for (int k = 0; k < 8; k++) v = v & 1 ? 0xEDB88320u ^ (v >> 1) : v >> 1;
++            table[i] = v;
++        }
++    });
++    for (size_t i = 0; i < n; i++) c = table[(c ^ p[i]) & 0xFF] ^ (c >> 8);
++    return c;
++}
++
++void Be32(std::vector<uint8_t>& o, uint32_t v) {
++    for (int s = 24; s >= 0; s -= 8) o.push_back(uint8_t(v >> s));
++}
++
++void Chunk(std::ofstream& f, const char* type, const std::vector<uint8_t>& data) {
++    std::vector<uint8_t> c;
++    Be32(c, uint32_t(data.size()));
++    c.insert(c.end(), type, type + 4);
++    c.insert(c.end(), data.begin(), data.end());
++    Be32(c, Crc(c.data() + 4, c.size() - 4) ^ 0xFFFFFFFFu);
++    f.write(reinterpret_cast<const char*>(c.data()), std::streamsize(c.size()));
++}
++
++// an RGBA8 PNG from BGRA pixels, its image data in stored (uncompressed) deflate blocks: no zlib needed, any viewer
++// and editor reads it, and a pack saved back from an editor comes out compressed anyway
++bool WritePng(const fs::path& path, const std::vector<uint8_t>& bgra, uint32_t w, uint32_t h) {
++    std::vector<uint8_t> raw;
++    raw.reserve(size_t(w * 4 + 1) * h);
++    for (uint32_t y = 0; y < h; y++) {
++        raw.push_back(0);  // filter: none
++        for (uint32_t x = 0; x < w; x++) {
++            const uint8_t* p = &bgra[(size_t(y) * w + x) * 4];
++            raw.insert(raw.end(), {p[2], p[1], p[0], p[3]});
++        }
++    }
++    std::vector<uint8_t> z{0x78, 0x01};
++    uint32_t a = 1, b = 0;
++    for (uint8_t v : raw) {
++        a = (a + v) % 65521;
++        b = (b + a) % 65521;
++    }
++    for (size_t off = 0; off < raw.size() || off == 0;) {
++        size_t n = std::min<size_t>(raw.size() - off, 65535);
++        bool last = off + n >= raw.size();
++        z.push_back(last ? 1 : 0);
++        z.insert(z.end(), {uint8_t(n), uint8_t(n >> 8), uint8_t(~n), uint8_t(~n >> 8)});
++        z.insert(z.end(), raw.begin() + std::ptrdiff_t(off), raw.begin() + std::ptrdiff_t(off + n));
++        off += n;
++        if (last) break;
++    }
++    Be32(z, b << 16 | a);
++    std::ofstream f(path, std::ios::binary);
++    if (!f) return false;
++    static const uint8_t sig[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
++    f.write(reinterpret_cast<const char*>(sig), 8);
++    std::vector<uint8_t> ihdr;
++    Be32(ihdr, w);
++    Be32(ihdr, h);
++    ihdr.insert(ihdr.end(), {8, 6, 0, 0, 0});  // 8 bits, RGBA, deflate, adaptive filters, not interlaced
++    Chunk(f, "IHDR", ihdr);
++    Chunk(f, "IDAT", z);
++    Chunk(f, "IEND", {});
++    return bool(f);
++}
++
++}  // namespace
++
++bool Active() {
++    const State& s = Get();
++    return s.dump || !s.files.empty();
++}
++
++bool Eligible(const TextureDesc& d) {
++    return !d.cube && d.depth == 1 && d.format != kFmtYuy2 && d.format != kFmtUyvy && !Format(d.format).depth &&
++           d.width && d.height;
++}
++
++uint64_t Key(const TextureDesc& d, const uint8_t* guest, uint64_t palette) {
++    const uint32_t shape[4] = {d.format, d.width, d.height, d.linear ? d.pitch : 0};
++    return Hash(guest, LevelSize(d, 0), Hash(shape, sizeof shape, palette ^ 0x7E78ull));
++}
++
++std::shared_ptr<const Image> Find(uint64_t key, const TextureDesc& d) {
++    State& s = Get();
++    auto file = s.files.find(key);
++    if (file == s.files.end()) return nullptr;
++    auto it = s.decoded.find(key);
++    if (it == s.decoded.end()) {
++        auto img = std::make_shared<Image>();
++        std::vector<uint8_t> px;
++        if (LoadPng(file->second, px, img->w, img->h)) {
++            img->levels.push_back(std::move(px));
++            MakeMips(*img);
++            LOGR("textures: %016llX replaced by %s (%ux%u)", (unsigned long long)key, file->second.string().c_str(),
++                 img->w, img->h);
++            it = s.decoded.emplace(key, std::move(img)).first;
++        } else {
++            LOGE("textures: %s could not be read as a PNG", file->second.string().c_str());
++            it = s.decoded.emplace(key, nullptr).first;
++        }
++    }
++    const auto& img = it->second;
++    // texel coordinates: a rect texture is only replaced by a picture of its own size
++    if (img && d.linear && (img->w != d.width || img->h != d.height)) {
++        LOG_FIRST(16, "textures: %016llX is a %ux%u rect texture, its %ux%u replacement is not used", (unsigned long long)key,
++                  d.width, d.height, img->w, img->h);
++        return nullptr;
++    }
++    return img;
++}
++
++void Dump(uint64_t key, const TextureDesc& d, const uint8_t* guest, const uint32_t* palette) {
++    State& s = Get();
++    if (!s.dump || !s.dumped.insert(key).second) return;
++    std::vector<uint8_t> px;
++    const FormatInfo& fi = Format(d.format);
++    if (d.format == kFmtDxt1 || d.format == kFmtDxt3 || d.format == kFmtDxt5) {
++        DecodeDxt(d.format, guest, d.width, d.height, px);
++    } else if (!fi.compressed) {
++        uint32_t pitch = 0;
++        DecodeLevel(d, 0, 0, guest, palette, px, pitch);
++        if (pitch != d.width * 4) return;
++    } else {
++        return;
++    }
++    char name[32];
++    std::snprintf(name, sizeof name, "%016llX.png", (unsigned long long)key);
++    if (!WritePng(s.dump_dir / name, px, d.width, d.height)) LOG_FIRST(4, "textures: could not write %s", name);
++}
++
++}  // namespace gpu::replace
+diff --git a/runtime/gpu/replace.h b/runtime/gpu/replace.h
+new file mode 100644
+index 0000000..7f6b912
+--- /dev/null
++++ b/runtime/gpu/replace.h
+@@ -0,0 +1,36 @@
++#pragma once
++// Texture replacement and dumping, for both backends.
++//
++// Every texture the title uploads has a key: a hash of its first level's bytes as guest memory holds them, with its
++// format, size and (for P8) palette. A PNG named <key>.png anywhere under textures/ beside the executable replaces
++// that texture, at any size, with a mip chain made from it. With XBE_TEXTURE_DUMP set, every texture that could be
++// replaced is written once to textures_dump/<key>.png, so a pack starts from the title's own pictures.
++//
++// Rect (linear) textures are sampled in texels, so only a replacement of the same size is used for one. Cube maps,
++// volumes and video formats are never keyed.
++#include <cstdint>
++#include <memory>
++#include <vector>
++
++#include "gpu/texture.h"
++
++namespace gpu::replace {
++
++// a replacement picture: BGRA8 levels, the first w x h, each next one half the size down to 1 x 1
++struct Image {
++    uint32_t w = 0, h = 0;
++    std::vector<std::vector<uint8_t>> levels;
++};
++
++// render thread: replacements or dumping are on (textures/ holds PNGs, or XBE_TEXTURE_DUMP is set)
++bool Active();
++// a texture the scheme applies to at all
++bool Eligible(const TextureDesc& d);
++// d's key from its first level in guest memory and the palette's hash (0 without one)
++uint64_t Key(const TextureDesc& d, const uint8_t* guest, uint64_t palette);
++// the replacement for key, decoded once and kept; null when there is none or it cannot be used for d
++std::shared_ptr<const Image> Find(uint64_t key, const TextureDesc& d);
++// dumping on: writes d's first level once per key
++void Dump(uint64_t key, const TextureDesc& d, const uint8_t* guest, const uint32_t* palette);
++
++}  // namespace gpu::replace
+diff --git a/runtime/gpu/vulkan.cpp b/runtime/gpu/vulkan.cpp
+index 63147d9..360c881 100644
+--- a/runtime/gpu/vulkan.cpp
++++ b/runtime/gpu/vulkan.cpp
+@@ -37,6 +37,7 @@
+ #include "core/diag.h"
+ #include "core/log.h"
+ #include "gpu/backend.h"
++#include "gpu/replace.h"
+ #include "gpu/shaders.h"
+ #include "gpu/spirv.h"
+ #include "gpu/texture.h"
+@@ -268,6 +269,7 @@ struct Target {
+ struct Tex {
+     ImageRes res; TextureDesc d; VkFormat fmt = VK_FORMAT_UNDEFINED;
+     uint32_t levels = 1; uint64_t sig = 0, frame = 0, palette = 0; uint8_t flags = 0;
++    uint64_t replaced = 0;  // the replace::Key whose picture it holds instead of the guest bytes, 0 for none
+ };
+ bool ChangedTarget(const Target& t) {
+     if (t.drawn || t.read.empty()) return false;
+@@ -419,6 +421,8 @@ private:
+     VkImageView BindGuestTexture(const State& s, int stage, const TextureDesc& d, const FormatInfo& fi, DrawTextures& stages);
+     bool CreateTexImage(Tex& tx, const TextureDesc& d, const FormatInfo& fi);
+     void UploadTexImage(Tex& tx, const TextureDesc& d, const FormatInfo& fi, const uint8_t* p, const uint32_t* colours);
++    // a replacement picture (gpu/replace.h) into tx, made again at its size; false when it could not be made
++    bool UploadReplacement(Tex& tx, const replace::Image& img, uint64_t key);
+     ImageRes Feedback(Target& t);
+     void FillConstants(const State& s, const DrawShaders& sh, const DrawTextures& stages, GuestExtent size, DrawConstants& c);
+     VkDescriptorSet AllocDrawSet(VkBuffer vcBuf, uint64_t vcOff, VkBuffer dcBuf, uint64_t dcOff,
+@@ -1338,6 +1342,25 @@ bool VulkanBackend::CreateTexImage(Tex& tx, const TextureDesc& d, const FormatIn
+     if (tx.res.Valid()) g_vkPerf.newtex++;
+     return tx.res.Valid();
+ }
++bool VulkanBackend::UploadReplacement(Tex& tx, const replace::Image& img, uint64_t key) {
++    ImageRes res = CreateImage(img.w, img.h, kBgra, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 1,
++                               VK_IMAGE_TYPE_2D, uint32_t(img.levels.size()));
++    if (!res.Valid()) { LOG_FIRST(8, "vulkan: %ux%u replacement texture not made", img.w, img.h); return false; }
++    if (tx.res.Valid()) DeferDestroyImage(tx.res);
++    tx.res = res; tx.fmt = kBgra; tx.levels = uint32_t(img.levels.size()); tx.flags = 0; tx.replaced = key;
++    Transition(tx.res, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++    for (uint32_t l = 0; l < tx.levels; l++) {
++        const std::vector<uint8_t>& px = img.levels[l];
++        Alloc a = UploadAlloc(px.size(), 16); if (!a.cpu) break;
++        std::memcpy(a.cpu, px.data(), px.size());
++        VkBufferImageCopy region{}; region.bufferOffset = a.off;
++        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; region.imageSubresource.mipLevel = l; region.imageSubresource.layerCount = 1;
++        region.imageExtent = {std::max(img.w >> l, 1u), std::max(img.h >> l, 1u), 1};
++        vkCmdCopyBufferToImage(Cmd(), a.buffer, tx.res.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
++    }
++    Transition(tx.res, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++    return true;
++}
+ void VulkanBackend::UploadTexImage(Tex& tx, const TextureDesc& d, const FormatInfo& fi, const uint8_t* p, const uint32_t* colours) {
+     Transition(tx.res, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+     uint32_t faces = d.cube ? 6 : 1; std::vector<uint8_t> px;
+@@ -1378,7 +1401,21 @@ VkImageView VulkanBackend::BindGuestTexture(const State& s, int stage, const Tex
+         tx.frame = presents_ + 1; tx.palette = palette.hash;
+         const uint8_t* p = static_cast<const uint8_t*>(kernel::HostPtr(d.data));
+         uint64_t sig = MemSig(d.data, total) ^ DirtyEpoch(d.data) ^ palette.hash;
+-        if (sig != tx.sig || !same) { tx.sig = sig; UploadTexImage(tx, d, fi, p, palette.va ? palette.colours : nullptr); }
++        if (sig != tx.sig || !same) {
++            tx.sig = sig;
++            const uint32_t* colours = palette.va ? palette.colours : nullptr;
++            // texture packs (gpu/replace.h): the title's bytes pick a picture, or are dumped to make one
++            std::shared_ptr<const replace::Image> img; uint64_t rkey = 0;
++            if (replace::Active() && replace::Eligible(d)) { rkey = replace::Key(d, p, palette.hash); replace::Dump(rkey, d, p, colours); img = replace::Find(rkey, d); }
++            if (!(img && (tx.replaced == rkey || UploadReplacement(tx, *img, rkey)))) {
++                if (tx.replaced) {  // other bytes there now: the guest's own texture again, at its own size
++                    const uint64_t frame = tx.frame, pal = tx.palette;
++                    if (!CreateTexImage(tx, d, fi)) { textures_.erase(key); return VK_NULL_HANDLE; }
++                    tx.frame = frame; tx.palette = pal; tx.sig = sig;
++                }
++                UploadTexImage(tx, d, fi, p, colours);
++            }
++        }
+     }
+     if (fi.depth) info.shadow = ShadowDepthKind(d.format);
+     return tx.res.SampleView();

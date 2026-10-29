@@ -1,15 +1,19 @@
 #include "app/app.h"
+#include "common/game_options.h"
 #include "common/input_kbm.h"
 #include "common/overlay.h"
 #include "common/pad_script.h"
+#include "common/quit_prompt.h"
 
 namespace {
 
 // every polled pad: the scripted pad first (pad_script.cpp), then the keyboard and mouse
-// (input_kbm.cpp). Both only ever add to what a real controller reported.
+// (input_kbm.cpp). Both only ever add to what a real controller reported. The quit prompt
+// (quit_prompt.cpp) goes last: it reads the merged pad, and takes it from the game while it is up.
 void PadHook(int port, input::Pad& pad) {
     padscript::Apply(port, pad);
     kbm::Apply(port, pad);
+    quitprompt::Pad(port, pad);
 }
 
 }  // namespace
@@ -24,7 +28,7 @@ const app::GameInfo app::kGame = {
     .splash = L"splash",                  // optional splash.png or splash.bmp beside the exe
     .missing = L"Put the game in the assets folder: its disc image (.iso), or default.xbe with its DATA and movies folders beside it.",
     .images = {{"default.xbe", "Sims2"}}, // each recompiled xbe and its exe, for title launches
-    .options = {},                        // game settings kept in the settings file
+    .options = gameopt::Options(),        // game settings kept in the settings file: the developer options
     .load = nullptr,                      // reads more from the settings file's toml::table
     .save = nullptr,                      // writes more into it
     .init = nullptr,                      // after the settings load, before the window and boot

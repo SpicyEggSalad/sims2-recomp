@@ -1,0 +1,485 @@
+From 4de8288c69df6acb8c1b587b40f6537da8598d0f Mon Sep 17 00:00:00 2001
+From: SpicyEggSalad <177426835+SpicyEggSalad@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 07:36:25 +0000
+Subject: [PATCH 3/5] gpu: read back 16 bit targets in their own format, at
+ console size
+
+Read-backs assumed 32 bit surfaces: a 16 bit render target (R5G6B5,
+A1R5G5B5, X1R5G5B5, A4R4G4B4) was refused as too small, so the title
+read nothing back. Sims 2 paints easel pictures this way and every
+painting but one came out black. Targets now carry the guest surface's
+format, pitch and bytes a pixel, and Sync and DeliverLate pack the
+pixels into it, in both backends.
+
+Such a surface is drawn to be read back, often colour keyed: Sims 2's
+self portrait clears to a key colour and turns exactly-key pixels into
+background. At render scale the read-back shrink blended the edges into
+the key and left a pink fringe, so these targets and the depth drawn
+with them are now made at the console's size.
+
+Captures also list each stage's filter and address modes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/gpu/d3d12.cpp  | 118 ++++++++++++++++++++++++++++++++---------
+ runtime/gpu/ext.h      |   2 +
+ runtime/gpu/vulkan.cpp |  93 ++++++++++++++++++++++++--------
+ 3 files changed, 167 insertions(+), 46 deletions(-)
+
+diff --git a/runtime/gpu/d3d12.cpp b/runtime/gpu/d3d12.cpp
+index ab38b02..a1d1900 100644
+--- a/runtime/gpu/d3d12.cpp
++++ b/runtime/gpu/d3d12.cpp
+@@ -344,11 +344,48 @@ uint8_t ShadowDepthKind(uint32_t format) { return format == kFmtD16 || format ==
+ // bytes per row of a 32 bit surface in guest memory, rounded to 64
+ uint32_t GuestPitch(uint32_t width) { return (width * 4 + 63) & ~63u; }
+ 
+-// A read-back writes GuestPitch(gw) rows of gh into guest memory. Targets are found by address alone, so a smaller
++// the 16 bit colour formats a target is read back into, linear and swizzled: R5G6B5, A1R5G5B5, X1R5G5B5, A4R4G4B4
++bool Packed16(uint32_t fmt) {
++    switch (fmt) {
++        case 0x02: case 0x03: case 0x04: case 0x05: case 0x10: case 0x11: case 0x1C: case 0x1D: return true;
++        default: return false;
++    }
++}
++
++// a BGRA pixel in a 16 bit console colour, the layouts Texel decodes
++uint16_t Pack16(uint32_t fmt, const uint8_t* p) {
++    uint32_t b = p[0], g = p[1], r = p[2], a = p[3];
++    switch (fmt) {
++        case 0x05: case 0x11: return uint16_t((r >> 3) << 11 | (g >> 2) << 5 | b >> 3);
++        case 0x04: case 0x1D: return uint16_t((a >> 4) << 12 | (r >> 4) << 8 | (g >> 4) << 4 | b >> 4);
++        case 0x03: case 0x1C: return uint16_t((r >> 3) << 10 | (g >> 3) << 5 | b >> 3);
++        default: return uint16_t((a >= 128 ? 0x8000u : 0u) | (r >> 3) << 10 | (g >> 3) << 5 | b >> 3);  // A1R5G5B5
++    }
++}
++
++// h BGRA rows src_pitch apart as a surface of fmt holds them: rows of w * bpp bytes, back to back
++std::vector<uint8_t> GuestRows(const uint8_t* src, uint32_t src_pitch, uint32_t w, uint32_t h, uint32_t fmt, uint32_t bpp) {
++    std::vector<uint8_t> out(size_t(w) * h * bpp);
++    for (uint32_t y = 0; y < h; y++) {
++        const uint8_t* s = src + size_t(y) * src_pitch;
++        uint8_t* d = &out[size_t(y) * w * bpp];
++        if (bpp == 4) {
++            std::memcpy(d, s, size_t(w) * 4);
++            continue;
++        }
++        for (uint32_t x = 0; x < w; x++) {
++            uint16_t v = Pack16(fmt, s + x * 4);
++            std::memcpy(d + x * 2, &v, 2);
++        }
++    }
++    return out;
++}
++
++// A read-back writes gh rows pitch apart into guest memory. Targets are found by address alone, so a smaller
+ // surface the title allocated where a freed target lived would take the old target's size: refused when the title's
+ // own size for the surface is smaller. size 0 is unknown (a swizzled container) and is written as before.
+-bool ReadBackFits(uint32_t data, uint32_t gw, uint32_t gh, uint32_t size) {
+-    uint64_t bytes = uint64_t(GuestPitch(gw)) * gh;
++bool ReadBackFits(uint32_t data, uint32_t gw, uint32_t gh, uint32_t pitch, uint32_t size) {
++    uint64_t bytes = uint64_t(pitch) * gh;
+     if (!size || bytes <= size) return true;
+     static std::mutex m;
+     static std::unordered_set<uint32_t> refused;
+@@ -420,8 +457,8 @@ uint64_t MemSig(uint32_t data, uint32_t total) {
+ // MemSig samples a big surface and misses small writes (XFONT text): after a Sync every byte is compared
+ bool Changed(const Target& t) {
+     if (t.drawn || t.read.empty()) return false;
+-    uint32_t row = t.gw * 4;
+-    uint32_t pitch = GuestPitch(t.gw);
++    uint32_t row = t.gw * t.gbpp;
++    uint32_t pitch = t.gpitch;
+     const uint8_t* p = static_cast<const uint8_t*>(kernel::HostPtr(t.data));
+     for (uint32_t y = 0; y < t.gh; y++) {
+         if (std::memcmp(p + size_t(y) * pitch, &t.read[size_t(y) * row], row)) return true;
+@@ -726,7 +763,7 @@ private:
+         bool sized;  // the entry is there at the surface's size
+     };
+     Target* FindTarget(const Surface& s, bool depth);
+-    Target* EnsureTarget(const Surface& s, bool depth);
++    Target* EnsureTarget(const Surface& s, bool depth, const Surface* colour = nullptr);
+     // EnsureTarget's steps, in call order
+     TargetSlot FindTargetSlot(const Surface& s, bool depth, uint64_t alt);
+     uint64_t SizedTargetKey(uint32_t data, bool depth, uint32_t gw, uint32_t gh) const;
+@@ -859,6 +896,9 @@ private:
+         uint64_t delivered = 0;
+         uint32_t gw = 0;
+         uint32_t gh = 0;
++        uint32_t gfmt = 0;  // the target's guest format, pitch and bytes a pixel, as Sync writes them
++        uint32_t gpitch = 0;
++        uint32_t gbpp = 4;
+         uint32_t row_pitch = 0;
+         uint32_t next = 0;
+     };
+@@ -1188,7 +1228,7 @@ GuestExtent D3D12Backend::BoundExtent(const Surface& s) const {
+ 
+ // the host texture of a new target, at render scale or the extension's
+ bool D3D12Backend::CreateTargetResource(Target& t, const Surface& s) {
+-    float sc = scale_;
++    float sc = t.unscaled ? 1.0f : scale_;
+     if (ext_) ext_->MakeTarget(s, t.depth, t.gw, t.gh, sc, t.fmt);
+     // the frame keeps its guest extent: only the pixels behind it grow, and the viewport fold's offset moves
+     // the world to the new centre, which leaves the console's 640 x 480 view of itself untouched
+@@ -1274,25 +1314,45 @@ Target* D3D12Backend::FindTarget(const Surface& s, bool depth) {
+     return &slot.it->second;
+ }
+ 
+-// the surface's target, made again at its size when that changed
+-Target* D3D12Backend::EnsureTarget(const Surface& s, bool depth) {
++// a 16 bit linear colour surface: read back in its own format at its own pitch, and drawn at console size
++static bool PackedSurface(const Surface& s, TextureDesc& d) {
++    uint32_t w, h;
++    SurfaceSize(s, w, h);
++    return s.header && Describe(s.header, d) && Packed16(d.format) && d.linear && d.pitch >= w * 2;
++}
++
++// the surface's target, made again at its size when that changed. colour: the colour surface drawn with a depth one
++//
++// A 16 bit colour surface is what the title draws to read back, colour keyed: Sims 2 clears its portrait target to a
++// key colour, draws the Sim and turns every pixel that is exactly the key into background. Drawn at render scale, the
++// read-back's shrink blends the edge pixels with the key, which then misses it and leaves a fringe. Such a target and
++// the depth drawn with it keep the console's size, so the CPU gets the console's pixels and nothing is shrunk.
++Target* D3D12Backend::EnsureTarget(const Surface& s, bool depth, const Surface* colour) {
+     if (!s.header) return nullptr;
+     uint64_t alt = 0;
+     if (ext_ && !ext_->TargetKey(s, depth, alt)) return nullptr;
+     TargetSlot slot = FindTargetSlot(s, depth, alt);
+     target_used_[slot.data] = frame_;
+-    if (slot.sized) return &slot.it->second;
++    TextureDesc gd{};
++    bool packed = !depth && PackedSurface(s, gd);
++    TextureDesc cd{};
++    bool unscaled = depth ? colour && PackedSurface(*colour, cd) : packed;
++    if (slot.sized && slot.it->second.unscaled == unscaled) return &slot.it->second;
+     if (slot.it != targets_.end()) ReleaseTarget(slot.it);
+     Target t;
+     t.depth = depth;
+     t.gw = slot.gw;
+     t.gh = slot.gh;
++    t.unscaled = unscaled;
+     if (!CreateTargetResource(t, s)) return nullptr;
+     g_perf.targets++;
+     // an empty pool drops the new resource with t
+     if (!CreateTargetView(t)) return nullptr;
+     t.data = slot.data;
+-    t.bytes = GuestPitch(slot.gw) * slot.gh;
++    t.gfmt = packed ? gd.format : 0;
++    t.gbpp = packed ? 2 : 4;
++    t.gpitch = packed ? gd.pitch : GuestPitch(slot.gw);
++    t.bytes = t.gpitch * slot.gh;
+     if (depth) t.bytes = slot.gw * slot.gh * 4;
+     t.epoch = DirtyEpoch(slot.data);
+     t.sig = MemSig(slot.data, t.bytes);
+@@ -1302,7 +1362,7 @@ Target* D3D12Backend::EnsureTarget(const Surface& s, bool depth) {
+ 
+ bool D3D12Backend::BindTargets(const State& s) {
+     Target* rt = EnsureTarget(s.rt, false);
+-    Target* ds = s.rs[kRsZEnable] || s.rs[kRsStencilEnable] ? EnsureTarget(s.zs, true) : nullptr;
++    Target* ds = s.rs[kRsZEnable] || s.rs[kRsStencilEnable] ? EnsureTarget(s.zs, true, &s.rt) : nullptr;
+     if (rt && ds && (rt->w != ds->w || rt->h != ds->h)) ds = nullptr;
+     if (!rt && !ds) return false;
+     if (rt) {
+@@ -2441,8 +2501,11 @@ void D3D12Backend::CaptureTextures(const State& s, const DrawTextures& stages) {
+             continue;
+         }
+         bool tg = targets_.count(SizedTargetKey(d.data, Format(d.format).depth, d.width, d.height));
+-        fprintf(cap_, " | t%d %08X fmt %X %ux%u%s%s", i, d.data, d.format, d.width, d.height, tg ? " target" : "",
+-                res ? "" : " unbound");
++        // D3DTEXF mag/min/mip (1 point, 2 linear, 3 anisotropic, 4 quincunx, 5 gaussian cubic) and D3DTADDRESS u/v
++        const auto& ts = s.tss[size_t(i)];
++        fprintf(cap_, " | t%d %08X fmt %X %ux%u%s%s filter %u/%u/%u addr %u/%u", i, d.data, d.format, d.width, d.height,
++                tg ? " target" : "", res ? "" : " unbound", ts[kTssMagFilter], ts[kTssMinFilter], ts[kTssMipFilter],
++                ts[kTssAddressU], ts[kTssAddressV]);
+         if (res && !tg && stages.info[i].kind == kTex2D && cap_seen_.insert(d.data).second) {
+             bool zero;
+             std::string guest = GuestTextureBytes(d, zero);
+@@ -2898,7 +2961,7 @@ void D3D12Backend::Clear(const State& s, uint32_t count, const uint8_t* rects, u
+                 color, z);
+     }
+     Target* rt = (flags & kClearTarget) ? EnsureTarget(s.rt, false) : nullptr;
+-    Target* ds = (flags & (kClearZ | kClearStencil)) ? EnsureTarget(s.zs, true) : nullptr;
++    Target* ds = (flags & (kClearZ | kClearStencil)) ? EnsureTarget(s.zs, true, &s.rt) : nullptr;
+     uint32_t gw;
+     uint32_t gh;
+     SurfaceSize(rt ? s.rt : s.zs, gw, gh);
+@@ -3754,7 +3817,7 @@ void D3D12Backend::Sync(uint32_t data, uint32_t size) {
+     }
+     auto it = targets_.find(TargetMapKey(data, false));
+     if (it == targets_.end() || !it->second.drawn || TargetStale(data)) return;
+-    if (!ReadBackFits(data, it->second.gw, it->second.gh, size)) return;
++    if (!ReadBackFits(data, it->second.gw, it->second.gh, it->second.gpitch, size)) return;
+     PerfScope perf_sync{g_perf.sync};
+     g_perf.syncs++;
+     if (diag::Perf()) {
+@@ -3767,11 +3830,12 @@ void D3D12Backend::Sync(uint32_t data, uint32_t size) {
+     if (!src.res) return;
+     std::vector<uint8_t> px;
+     if (!ReadBack(src.res, t.gw, t.gh, px)) return;
+-    // color targets are 32 bit linear in guest memory, the pitch rounds to 64 bytes
+-    uint32_t pitch = GuestPitch(t.gw);
++    // color targets are linear in guest memory: 32 bit rows a 64 byte rounded pitch apart, or a 16 bit surface's own
++    std::vector<uint8_t> rows = GuestRows(px.data(), t.gw * 4, t.gw, t.gh, t.gfmt, t.gbpp);
++    uint32_t row = t.gw * t.gbpp;
+     uint8_t* guest = static_cast<uint8_t*>(kernel::HostPtr(data));
+-    for (uint32_t y = 0; y < t.gh; y++) std::memcpy(guest + size_t(y) * pitch, &px[size_t(y) * t.gw * 4], t.gw * 4);
+-    t.read = std::move(px);
++    for (uint32_t y = 0; y < t.gh; y++) std::memcpy(guest + size_t(y) * t.gpitch, &rows[size_t(y) * row], row);
++    t.read = std::move(rows);
+     t.drawn = false;
+     t.sig = MemSig(t.data, t.bytes);
+ }
+@@ -3790,7 +3854,7 @@ bool D3D12Backend::DeliverLate(uint32_t data, uint32_t size) {
+     if (it == late_.end()) return false;
+     Late& l = it->second;
+     // copies of an older, larger target at this address: Sync then reads the surface's current target, if it fits
+-    if (!ReadBackFits(data, l.gw, l.gh, size)) return false;
++    if (!ReadBackFits(data, l.gw, l.gh, l.gpitch, size)) return false;
+     uint64_t done = fence_->GetCompletedValue();
+     uint64_t now = presents_seen_.load();
+     int best = -1;
+@@ -3814,11 +3878,12 @@ bool D3D12Backend::DeliverLate(uint32_t data, uint32_t size) {
+         // the last row is not padded to the pitch: a range to the end of the pitch fails to map
+         D3D12_RANGE rr{0, size_t(l.row_pitch) * (l.gh - 1) + l.gw * 4};
+         if (FAILED(l.rb[best]->Map(0, &rr, reinterpret_cast<void**>(&p)))) return false;
+-        uint32_t pitch = GuestPitch(l.gw);
+-        uint8_t* dst = static_cast<uint8_t*>(kernel::HostPtr(data));
+-        for (uint32_t y = 0; y < l.gh; y++) std::memcpy(dst + size_t(y) * pitch, p + size_t(y) * l.row_pitch, l.gw * 4);
++        std::vector<uint8_t> rows = GuestRows(p, l.row_pitch, l.gw, l.gh, l.gfmt, l.gbpp);
+         D3D12_RANGE none{0, 0};
+         l.rb[best]->Unmap(0, &none);
++        uint32_t row = l.gw * l.gbpp;
++        uint8_t* dst = static_cast<uint8_t*>(kernel::HostPtr(data));
++        for (uint32_t y = 0; y < l.gh; y++) std::memcpy(dst + size_t(y) * l.gpitch, &rows[size_t(y) * row], row);
+         l.delivered = l.fence[best];
+     }
+     return true;
+@@ -3834,6 +3899,9 @@ void D3D12Backend::ResetLate(Late& l, const Target& t) {
+     l = Late{};
+     l.gw = t.gw;
+     l.gh = t.gh;
++    l.gfmt = t.gfmt;
++    l.gpitch = t.gpitch;
++    l.gbpp = t.gbpp;
+ }
+ 
+ // the target as a guest sized BGRA copy source, shrunk into l.down when it is not one already
+@@ -3884,7 +3952,7 @@ void D3D12Backend::RecordLate(uint32_t data) {
+     t.read.clear();
+     std::lock_guard lock(late_lock_);
+     Late& l = late_[data];
+-    if (l.gw != t.gw || l.gh != t.gh) {
++    if (l.gw != t.gw || l.gh != t.gh || l.gfmt != t.gfmt || l.gpitch != t.gpitch) {
+         if (diag::Perf()) LOG_FIRST(16, "perf: late %08X ring reset, %ux%u -> %ux%u", data, l.gw, l.gh, t.gw, t.gh);
+         ResetLate(l, t);
+     }
+diff --git a/runtime/gpu/ext.h b/runtime/gpu/ext.h
+index 8c04f5e..4e33d29 100644
+--- a/runtime/gpu/ext.h
++++ b/runtime/gpu/ext.h
+@@ -29,6 +29,8 @@ struct Target {
+     uint32_t view = 0;
+     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+     uint32_t data = 0, bytes = 0;
++    uint32_t gfmt = 0, gpitch = 0, gbpp = 4;  // a colour surface as guest memory holds it: format, row pitch, bytes a pixel
++    bool unscaled = false;  // kept at console size: a 16 bit surface the title reads back, or the depth drawn with one
+     uint64_t epoch = 0, sig = 0;  // last lock seen, guest memory as last matched
+     bool drawn = false;           // the GPU wrote it since the last readback
+     std::vector<uint8_t> read;    // what Sync left in guest memory
+diff --git a/runtime/gpu/vulkan.cpp b/runtime/gpu/vulkan.cpp
+index a32871c..63147d9 100644
+--- a/runtime/gpu/vulkan.cpp
++++ b/runtime/gpu/vulkan.cpp
+@@ -202,8 +202,37 @@ VkFormat HostFormatVk(Host h) {
+ }
+ uint8_t ShadowDepthKind(uint32_t format) { return format == 0x2C || format == 0x30 ? 2 : 1; }
+ uint32_t GuestPitch(uint32_t width) { return (width * 4 + 63) & ~63u; }
+-bool ReadBackFits(uint32_t data, uint32_t gw, uint32_t gh, uint32_t size) {
+-    uint64_t bytes = uint64_t(GuestPitch(gw)) * gh;
++// the 16 bit colour formats a target is read back into, linear and swizzled: R5G6B5, A1R5G5B5, X1R5G5B5, A4R4G4B4
++bool Packed16(uint32_t fmt) {
++    switch (fmt) {
++        case 0x02: case 0x03: case 0x04: case 0x05: case 0x10: case 0x11: case 0x1C: case 0x1D: return true;
++        default: return false;
++    }
++}
++// a BGRA pixel in a 16 bit console colour, the layouts Texel decodes
++uint16_t Pack16(uint32_t fmt, const uint8_t* p) {
++    uint32_t b = p[0], g = p[1], r = p[2], a = p[3];
++    switch (fmt) {
++        case 0x05: case 0x11: return uint16_t((r >> 3) << 11 | (g >> 2) << 5 | b >> 3);
++        case 0x04: case 0x1D: return uint16_t((a >> 4) << 12 | (r >> 4) << 8 | (g >> 4) << 4 | b >> 4);
++        case 0x03: case 0x1C: return uint16_t((r >> 3) << 10 | (g >> 3) << 5 | b >> 3);
++        default: return uint16_t((a >= 128 ? 0x8000u : 0u) | (r >> 3) << 10 | (g >> 3) << 5 | b >> 3);  // A1R5G5B5
++    }
++}
++// h BGRA rows src_pitch apart as a surface of fmt holds them: rows of w * bpp bytes, back to back
++std::vector<uint8_t> GuestRows(const uint8_t* src, uint32_t src_pitch, uint32_t w, uint32_t h, uint32_t fmt, uint32_t bpp) {
++    std::vector<uint8_t> out(size_t(w) * h * bpp);
++    for (uint32_t y = 0; y < h; y++) {
++        const uint8_t* s = src + size_t(y) * src_pitch; uint8_t* d = &out[size_t(y) * w * bpp];
++        if (bpp == 4) { std::memcpy(d, s, size_t(w) * 4); continue; }
++        for (uint32_t x = 0; x < w; x++) { uint16_t v = Pack16(fmt, s + x * 4); std::memcpy(d + x * 2, &v, 2); }
++    }
++    return out;
++}
++// A read-back writes gh rows pitch apart into guest memory: refused when the title's own size for the surface is
++// smaller. size 0 is unknown (a swizzled container) and is written as before.
++bool ReadBackFits(uint32_t data, uint32_t gw, uint32_t gh, uint32_t pitch, uint32_t size) {
++    uint64_t bytes = uint64_t(pitch) * gh;
+     if (!size || bytes <= size) return true;
+     static std::mutex m; static std::unordered_set<uint32_t> refused; bool first;
+     { std::lock_guard lock(m); first = refused.insert(data).second; }
+@@ -232,6 +261,8 @@ struct Target {
+     ImageRes res, fb; bool depth = false;
+     uint32_t gw = 0, gh = 0, w = 0, h = 0; float dx = 0;
+     uint32_t data = 0, bytes = 0; uint64_t epoch = 0, sig = 0;
++    uint32_t gfmt = 0, gpitch = 0, gbpp = 4;  // a colour surface as guest memory holds it: format, row pitch, bytes a pixel
++    bool unscaled = false;  // kept at console size: a 16 bit surface the title reads back, or the depth drawn with one
+     bool drawn = false; std::vector<uint8_t> read;
+ };
+ struct Tex {
+@@ -240,7 +271,7 @@ struct Tex {
+ };
+ bool ChangedTarget(const Target& t) {
+     if (t.drawn || t.read.empty()) return false;
+-    uint32_t row = t.gw * 4, pitch = GuestPitch(t.gw);
++    uint32_t row = t.gw * t.gbpp, pitch = t.gpitch;
+     const uint8_t* p = static_cast<const uint8_t*>(kernel::HostPtr(t.data));
+     for (uint32_t y = 0; y < t.gh; y++) if (std::memcmp(p + size_t(y) * pitch, &t.read[size_t(y) * row], row)) return true;
+     return false;
+@@ -331,6 +362,7 @@ private:
+         VkFence submitFence[kFrames] = {};
+         bool rbCoherent[kFrames] = {true, true, true};
+         uint32_t gw = 0, gh = 0, next = 0;
++        uint32_t gfmt = 0, gpitch = 0, gbpp = 4;  // the target's guest format, pitch and bytes a pixel, as Sync writes them
+     };
+     bool CreateDeviceAndSwap();
+     bool CreateSwapchain();
+@@ -368,7 +400,7 @@ private:
+     TargetSlot FindTargetSlot(const Surface& s, bool depth, uint64_t alt);
+     uint64_t SizedTargetKey(uint32_t data, bool depth, uint32_t gw, uint32_t gh) const;
+     Target* FindTarget(const Surface& s, bool depth);
+-    Target* EnsureTarget(const Surface& s, bool depth);
++    Target* EnsureTarget(const Surface& s, bool depth, const Surface* colour = nullptr);
+     bool TargetStale(uint32_t data) const;
+     void ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator it);
+     bool BindTargets(const State& s);
+@@ -1078,20 +1110,35 @@ void VulkanBackend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator
+     if (boundRt_ == &it->second || boundDs_ == &it->second) boundRt_ = boundDs_ = nullptr;
+     DeferDestroyImage(it->second.res); DeferDestroyImage(it->second.fb); targets_.erase(it);
+ }
+-Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth) {
++// a 16 bit linear colour surface: read back in its own format at its own pitch, and drawn at console size
++static bool PackedSurface(const Surface& s, TextureDesc& d) {
++    uint32_t w, h; SurfaceSize(s, w, h);
++    return s.header && Describe(s.header, d) && Packed16(d.format) && d.linear && d.pitch >= w * 2;
++}
++// The surface's target, made again at its size when that changed. colour: the colour surface drawn with a depth one.
++// A 16 bit colour surface is what the title draws to read back, colour keyed (Sims 2's self portrait: a key colour
++// clear, the Sim, every pixel exactly the key turned to background); drawn at render scale, the read-back's shrink
++// blends the edges with the key and leaves a fringe, so it and the depth drawn with it keep the console's size.
++Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth, const Surface* colour) {
+     if (!s.header) return nullptr;
+     TargetSlot slot = FindTargetSlot(s, depth, 0);
+     targetUsed_[slot.data] = frame_;
+-    if (slot.sized) return &slot.it->second;
++    TextureDesc gd{}, cd{};
++    bool packed = !depth && PackedSurface(s, gd);
++    bool unscaled = depth ? colour && PackedSurface(*colour, cd) : packed;
++    if (slot.sized && slot.it->second.unscaled == unscaled) return &slot.it->second;
+     if (slot.it != targets_.end()) ReleaseTarget(slot.it);
+-    Target t; t.depth = depth; t.gw = slot.gw; t.gh = slot.gh;
++    Target t; t.depth = depth; t.gw = slot.gw; t.gh = slot.gh; t.unscaled = unscaled;
+     uint32_t gw = IsFrameTarget(t) ? WidenedGuestWidth() : t.gw;
+     t.dx = (gw - t.gw) / 2.0f;
+-    t.w = std::max(1u, uint32_t(std::lround(gw * scale_))); t.h = std::max(1u, uint32_t(std::lround(t.gh * scale_)));
++    const float sc = unscaled ? 1.0f : scale_;
++    t.w = std::max(1u, uint32_t(std::lround(gw * sc))); t.h = std::max(1u, uint32_t(std::lround(t.gh * sc)));
+     if (depth) t.res = CreateImage(t.w, t.h, depthFormat_, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT));
+     else t.res = CreateImage(t.w, t.h, kBgra, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT);
+     if (!t.res.Valid()) return nullptr;
+-    t.data = slot.data; t.bytes = depth ? slot.gw * slot.gh * 4 : GuestPitch(slot.gw) * slot.gh;
++    t.data = slot.data;
++    t.gfmt = packed ? gd.format : 0; t.gbpp = packed ? 2 : 4; t.gpitch = packed ? gd.pitch : GuestPitch(slot.gw);
++    t.bytes = depth ? slot.gw * slot.gh * 4 : t.gpitch * slot.gh;
+     if (depth) {
+         Transition(t.res, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+         VkImageSubresourceRange range{VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT), 0, 1, 0, 1}; VkClearDepthStencilValue v{1.0f, 0};
+@@ -1113,7 +1160,7 @@ bool VulkanBackend::TargetStale(uint32_t data) const {
+ }
+ bool VulkanBackend::BindTargets(const State& s) {
+     Target* rt = EnsureTarget(s.rt, false);
+-    Target* ds = s.rs[kRsZEnable] || s.rs[kRsStencilEnable] ? EnsureTarget(s.zs, true) : nullptr;
++    Target* ds = s.rs[kRsZEnable] || s.rs[kRsStencilEnable] ? EnsureTarget(s.zs, true, &s.rt) : nullptr;
+     if (rt && ds && (rt->w != ds->w || rt->h != ds->h)) ds = nullptr;
+     if (!rt && !ds) return false;
+     if (rt) { if (LatchCpuWrite(*rt)) UploadTarget(*rt, s.rt); Transition(rt->res, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL); rt->drawn = true; }
+@@ -1846,7 +1893,7 @@ void VulkanBackend::Clear(const State& s, uint32_t count, const uint8_t* rects,
+     VkPerfScope perfClear{g_vkPerf.clear}; g_vkPerf.clears++;
+     if (cap_) { CapStep(s.rt); std::fprintf(cap_, "%04u clear rt %08X ds %08X flags %X color %08X z %.3f\n", capI_++, s.rt.data, s.zs.data, flags, color, z); }
+     Target* rt = (flags & kClearTarget) ? EnsureTarget(s.rt, false) : nullptr;
+-    Target* ds = (flags & (kClearZ | kClearStencil)) ? EnsureTarget(s.zs, true) : nullptr;
++    Target* ds = (flags & (kClearZ | kClearStencil)) ? EnsureTarget(s.zs, true, &s.rt) : nullptr;
+     for (Target* t : {rt, ds}) {
+         if (!t) continue;
+         std::vector<ScaledRectI> rs;
+@@ -2355,15 +2402,17 @@ void VulkanBackend::Sync(uint32_t data, uint32_t size) {
+     if (LowPhysical(data)) { LOG_FIRST(8, "vulkan: read-back to low physical %08X refused", data); return; }
+     auto it = targets_.find(TargetMapKey(data, false));
+     if (it == targets_.end() || !it->second.drawn || TargetStale(data)) return;
+-    if (!ReadBackFits(data, it->second.gw, it->second.gh, size)) return;
++    if (!ReadBackFits(data, it->second.gw, it->second.gh, it->second.gpitch, size)) return;
+     Target& t = it->second;
+     ImageRes src = PrepareCopySource(t, nullptr); if (!src.Valid()) return;
+     std::vector<uint8_t> px; bool ok = ReadBackImage(src, t.gw, t.gh, px);
+     if (src.image != t.res.image) DestroyImage(src);
+     if (!ok) return;
+-    uint32_t pitch = GuestPitch(t.gw); uint8_t* guest = static_cast<uint8_t*>(kernel::HostPtr(data));
+-    for (uint32_t y = 0; y < t.gh; y++) std::memcpy(guest + size_t(y) * pitch, &px[size_t(y) * t.gw * 4], t.gw * 4);
+-    t.read = std::move(px); t.drawn = false; t.sig = MemSig(t.data, t.bytes);
++    // color targets are linear in guest memory: 32 bit rows a 64 byte rounded pitch apart, or a 16 bit surface's own
++    std::vector<uint8_t> rows = GuestRows(px.data(), t.gw * 4, t.gw, t.gh, t.gfmt, t.gbpp);
++    uint32_t row = t.gw * t.gbpp; uint8_t* guest = static_cast<uint8_t*>(kernel::HostPtr(data));
++    for (uint32_t y = 0; y < t.gh; y++) std::memcpy(guest + size_t(y) * t.gpitch, &rows[size_t(y) * row], row);
++    t.read = std::move(rows); t.drawn = false; t.sig = MemSig(t.data, t.bytes);
+ }
+ void VulkanBackend::SyncLate(uint32_t data, uint32_t size) { if (!DeliverLate(data, size)) Sync(data, size); RecordLate(data); }
+ bool VulkanBackend::DeliverLate(uint32_t data, uint32_t size) {
+@@ -2371,7 +2420,7 @@ bool VulkanBackend::DeliverLate(uint32_t data, uint32_t size) {
+     if (LowPhysical(data)) return false;
+     auto it = late_.find(data); if (it == late_.end()) return false;
+     Late& l = it->second;
+-    if (!ReadBackFits(data, l.gw, l.gh, size)) return false;
++    if (!ReadBackFits(data, l.gw, l.gh, l.gpitch, size)) return false;
+     uint64_t now = presentsSeen_.load(); int best = -1;
+     // D2: this runs on the title thread while Submit runs on the render thread. It
+     // touches no shared container: l is under lateLock_, and "finished" is the atomic
+@@ -2397,9 +2446,11 @@ bool VulkanBackend::DeliverLate(uint32_t data, uint32_t size) {
+             range.memory = l.rbm[best]; range.offset = 0; range.size = VK_WHOLE_SIZE;
+             if (vkInvalidateMappedMemoryRanges(device_, 1, &range) != VK_SUCCESS) { vkUnmapMemory(device_, l.rbm[best]); return false; }
+         }
+-        uint32_t pitch = GuestPitch(l.gw); uint8_t* dst = static_cast<uint8_t*>(kernel::HostPtr(data)); const uint8_t* sp = static_cast<const uint8_t*>(p);
+-        for (uint32_t y = 0; y < l.gh; y++) std::memcpy(dst + size_t(y) * pitch, sp + size_t(y) * l.gw * 4, l.gw * 4);
+-        vkUnmapMemory(device_, l.rbm[best]); l.delivered = l.fence[best];
++        std::vector<uint8_t> rows = GuestRows(static_cast<const uint8_t*>(p), l.gw * 4, l.gw, l.gh, l.gfmt, l.gbpp);
++        vkUnmapMemory(device_, l.rbm[best]);
++        uint32_t row = l.gw * l.gbpp; uint8_t* dst = static_cast<uint8_t*>(kernel::HostPtr(data));
++        for (uint32_t y = 0; y < l.gh; y++) std::memcpy(dst + size_t(y) * l.gpitch, &rows[size_t(y) * row], row);
++        l.delivered = l.fence[best];
+     }
+     return true;
+ }
+@@ -2409,10 +2460,10 @@ void VulkanBackend::RecordLate(uint32_t data) {
+     Target& t = it->second; t.sig = MemSig(t.data, t.bytes); t.read.clear();
+     std::lock_guard lock(lateLock_);
+     Late& l = late_[data];
+-    if (l.gw != t.gw || l.gh != t.gh) {
++    if (l.gw != t.gw || l.gh != t.gh || l.gfmt != t.gfmt || l.gpitch != t.gpitch) {
+         for (int i = 0; i < kFrames; i++) if (l.rb[i]) { VkBuffer rb = l.rb[i]; VkDeviceMemory rbm = l.rbm[i]; Cur().garbage.push_back([this, rb, rbm] { vkDestroyBuffer(device_, rb, nullptr); vkFreeMemory(device_, rbm, nullptr); }); }
+         if (l.down.Valid()) DeferDestroyImage(l.down);
+-        l = Late{}; l.gw = t.gw; l.gh = t.gh;
++        l = Late{}; l.gw = t.gw; l.gh = t.gh; l.gfmt = t.gfmt; l.gpitch = t.gpitch; l.gbpp = t.gbpp;
+     }
+     uint32_t slot = l.next;
+     if (l.fence[slot]) {
