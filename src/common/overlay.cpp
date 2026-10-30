@@ -4,8 +4,10 @@
 // window size or a pad exists.
 #include "common/overlay.h"
 
+#include "common/dpad_shape.h"
 #include "common/game_options.h"
 #include "common/input_kbm.h"
+#include "common/input_trace.h"
 #include "common/quit_prompt.h"
 
 #include <algorithm>
@@ -20,6 +22,7 @@
 #include <imgui.h>
 
 #include "app/app.h"
+#include "core/log.h"
 #if !defined(_WIN32)
 #include "app/platform.h"  // app::HostAspect
 #endif
@@ -554,6 +557,10 @@ void DrawSettings() {
     ImGui::SeparatorText("Game");
     if (BeginRows("##startup_rows", label_width)) {
         DrawGameRows(gameopt::Group::Startup);
+        Row("D-pad taps");
+        ImGui::Checkbox("##dpadshape", &dpadshape::On());
+        Note("Each D-pad press reaches the game for two ticks, as on the console, so one tap is one menu step; "
+             "holding repeats at the delay below.");
         Row("D-pad repeat delay");
         int repeat = int(gameopt::RepeatPercent());
         if (ImGui::SliderInt("##repeat", &repeat, int(gameopt::kRepeatMin), int(gameopt::kRepeatMax), "%d %%",
@@ -618,6 +625,14 @@ void Draw(double fps) {
     if (io.DisplaySize.x < 1.0f || io.DisplaySize.y < 1.0f) return;
     ScaleStyle(io);
     Sample(io.DeltaTime);
+    if (inputtrace::On()) {  // the present rate, beside the game tick rate hooks.cpp logs
+        static float since = 0.0f;
+        since += io.DeltaTime;
+        if (since >= 2.0f) {
+            since = 0.0f;
+            LOGR("render rate: %.0f fps", fps);
+        }
+    }
     gameopt::Hold();
 
     // the window thread feeds every key message to ImGui under the same lock (main.cpp WndProc),

@@ -1,6 +1,8 @@
 #include "app/app.h"
+#include "common/dpad_shape.h"
 #include "common/game_options.h"
 #include "common/input_kbm.h"
+#include "common/input_trace.h"
 #include "common/overlay.h"
 #include "common/pad_script.h"
 #include "common/quit_prompt.h"
@@ -13,6 +15,8 @@ namespace {
 void PadHook(int port, input::Pad& pad) {
     padscript::Apply(port, pad);
     kbm::Apply(port, pad);
+    dpadshape::Apply(port, pad);
+    inputtrace::Pad(port, pad);
     quitprompt::Pad(port, pad);
 }
 

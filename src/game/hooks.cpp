@@ -28,10 +28,15 @@
 // only the quantisation after it, exactly as in The Urbz (D:/Urbz/src/game/hooks.cpp).
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 
+#include "common/dpad_shape.h"
 #include "common/game_options.h"
+#include "common/input_trace.h"
+#include "core/log.h"
 #include "cpu/x86_ops.h"
 #include "xdk/hle.h"
 
@@ -101,6 +106,7 @@ X86_FUNC(sub_001C2400) {
     X86_MEM32(0x3B810Cu) = X86_MEM32(0x3B810Cu) + uint32_t(ticks);
     ctx.eax = uint32_t(ticks);
     g_dt.store(dt, std::memory_order_relaxed);
+    dpadshape::FrameStep(dt);
     ctx.esp += 8;  // ret 4
 }
 
@@ -129,6 +135,41 @@ X86_FUNC(sub_001C2400) {
 // stock 10/3 counts gave a 167 ms delay and 50 ms repeat, fast enough to double a menu step on a
 // slightly long press, so the scale also carries the player's dpad_repeat_percent
 // (common/game_options.h): 200, the default, is the 30 Hz reading, 333 ms and 100 ms.
+// XBE_INPUT_TRACE: what the pad object the repeat function just ran for holds, as the menus read it. [obj+0x08] is
+// the held buttons, [obj+0x18] the buttons that went down this poll, [pad+0x1B4] those two with the auto-repeats
+// added: a line when the held buttons change or a menu is handed a press, with the frame counter and the pad
+// object, so two objects seeing one press, two presses in one hold and a repeat can be told apart. The bit order
+// of these words is the game's own, so the masks are logged whole.
+void TracePad(uint32_t pad, uint8_t* base) {
+    const uint32_t obj = X86_MEM32(pad + 0x200u);
+    if (obj < 0x10000u) return;
+    const uint32_t held = X86_MEM32(obj + 0x08u), down = X86_MEM32(obj + 0x18u), word = X86_MEM32(pad + 0x1B4u);
+    static std::mutex lock;
+    static uint32_t pads[16], last[16];
+    std::lock_guard<std::mutex> guard(lock);
+    // how fast the game really ticks: its frame counter against the clock, once a second
+    static auto since = std::chrono::steady_clock::now();
+    static uint32_t since_frame = X86_MEM32(0x3B8108u), polls = 0;
+    polls++;
+    auto now = std::chrono::steady_clock::now();
+    if (now - since >= std::chrono::seconds(2)) {
+        const uint32_t frame = X86_MEM32(0x3B8108u);
+        const double s = std::chrono::duration<double>(now - since).count();
+        LOGR("game rate: %.0f ticks/s (frame counter), %.0f pad polls/s", (frame - since_frame) / s, polls / s);
+        since = now;
+        since_frame = frame;
+        polls = 0;
+    }
+    size_t slot = 0;
+    while (slot < 15 && pads[slot] && pads[slot] != pad) slot++;
+    if (pads[slot] != pad) LOGR("game pad %08X: first seen, object %08X", pad, obj);
+    pads[slot] = pad;
+    if (held == last[slot] && !word) return;
+    last[slot] = held;
+    LOGR("game pad %08X: frame %u held %X down %X menus-get %X%s", pad, uint32_t(X86_MEM32(0x3B8108u)), held, down, word,
+         (word & ~down) ? " (repeat)" : "");
+}
+
 X86_FUNC(__imp__sub_001BCA50);
 X86_FUNC(sub_001BCA50) {
     if (HookOff("SIMS2_NO_REPEAT")) { __imp__sub_001BCA50(ctx, base); return; }
@@ -144,6 +185,7 @@ X86_FUNC(sub_001BCA50) {
     __imp__sub_001BCA50(ctx, base);
     X86_MEM8(pad + 0x1D8u) = delay;
     X86_MEM8(pad + 0x1D9u) = rate;
+    if (inputtrace::On()) TracePad(pad, base);
 }
 
 // ---------------------------------------------------------------------------

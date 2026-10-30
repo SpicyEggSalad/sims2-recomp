@@ -394,6 +394,20 @@ in the capture pinned it. `SetRenderTarget` now clears the scissors, as
 - Captures list each stage's filter and address modes; `out/build/release/
   capture.bat` launches with `XBE_LOG`, `XBE_PERF` and the capture on.
 
+### D-pad double inputs
+
+- Traced on a real controller (`XBE_INPUT_TRACE=1`, which logs host D-pad changes and what
+  the game's pad object holds): each tap reached the game as one press edge on one of its four
+  pad objects, with no chatter. The doubling is game logic: the menus read the D-pad as held,
+  the game ticks once per presented frame (165 a second at a 165 fps cap, 30 on the console),
+  so a 60 ms tap is held for ten ticks and a menu opens a view and closes it again.
+  `fps_cap = 30` removes it; a limiter that dropped the tick rate on button presses was tried
+  and rejected as too stuttery.
+- `src/common/dpad_shape.cpp` (F1 "D-pad taps", `dpad_shape`, default on): each D-pad press
+  is passed to the game for two real ticks, then dropped while the button stays down; a held
+  button repeats from the host at the `dpad_repeat_percent` delay and rate. Confirmed on the
+  three cases that doubled: save select, wrapping yes/no prompts, panels opened with the D-pad.
+
 ### Texture packs and save backups (SDK)
 
 - `gpu/replace.cpp`: each uploaded texture is keyed by a hash of its first level's

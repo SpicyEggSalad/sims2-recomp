@@ -4,6 +4,7 @@
 // one at any time; the ones read once at boot (skip_startup_movies) are set the moment they are registered, which
 // is before the game reads them.
 #include "common/game_options.h"
+#include "common/dpad_shape.h"
 
 #include <cstring>
 #include <iterator>
@@ -55,6 +56,7 @@ std::vector<app::Option> Options() {
     std::vector<app::Option> out;
     EachManaged([&](Managed& m) { out.push_back({m.key, &m.on, nullptr}); });
     out.push_back({"dpad_repeat_percent", nullptr, &RepeatPercent()});
+    out.push_back({"dpad_shape", &dpadshape::On(), nullptr});
     return out;
 }
 
