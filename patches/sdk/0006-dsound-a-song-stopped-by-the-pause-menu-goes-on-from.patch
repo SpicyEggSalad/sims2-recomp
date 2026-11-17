@@ -1,0 +1,450 @@
+From 266063cad24c094b3ce367726a93434df13f0076 Mon Sep 17 00:00:00 2001
+From: SpicyEggSalad <177426835+SpicyEggSalad@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 06:41:31 +0000
+Subject: [PATCH] dsound: a song stopped by the pause menu goes on from where
+ it was
+
+The title's pause menu releases the song stream and builds a new one from the
+start of the file, and a radio station builds one for another song. The host now
+remembers what a stream had taken when the pause menu stopped it. The same song
+again skips the packets already played; another song after the pause menu's own
+music is replaced by the stopped one, whose packets are kept, then read on from
+the wave bank (the kernel notes which file and byte each big read came from, and
+the bank's entry table gives the song's end). A stream let go of on its last
+packet plays that packet out instead of being cut. The stream log lines carry a
+fingerprint of each packet and the stream's own state.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ runtime/kernel/files.cpp |  30 +++++
+ runtime/xdk/dsound.cpp   | 234 ++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 261 insertions(+), 3 deletions(-)
+
+diff --git a/runtime/kernel/files.cpp b/runtime/kernel/files.cpp
+index 1ffd8f1..ad2ed6d 100644
+--- a/runtime/kernel/files.cpp
++++ b/runtime/kernel/files.cpp
+@@ -2,10 +2,13 @@
+ #include <cctype>
+ #include <chrono>
+ #include <cstdio>
++#include <deque>
+ #include <ctime>
+ #include <filesystem>
+ #include <fstream>
+ #include <map>
++#include <mutex>
++#include <string>
+ 
+ #include "kernel/disc.h"
+ #include "kernel/kernel.h"
+@@ -528,6 +531,28 @@ static uint64_t Offset(File& f, uint32_t off) {
+     return o >= 0 ? uint64_t(o) : f.pos;
+ }
+ 
++// The big reads the title made lately (a song is read in packets), so the audio code can tell where a packet came
++// from in the game's files: which file, and from which byte.
++struct ReadNote {
++    uint32_t buf, len;
++    uint64_t pos;
++    std::string path;
++};
++static std::mutex g_notes_lock;
++static std::deque<ReadNote> g_notes;
++
++bool FindRead(uint32_t at, uint32_t size, std::string& path, uint64_t& pos) {
++    std::lock_guard<std::mutex> lock(g_notes_lock);
++    for (auto it = g_notes.rbegin(); it != g_notes.rend(); ++it) {
++        if (at >= it->buf && uint64_t(at) + size <= uint64_t(it->buf) + it->len) {
++            path = it->path;
++            pos = it->pos + (at - it->buf);
++            return true;
++        }
++    }
++    return false;
++}
++
+ // pages is the FILE_SEGMENT_ELEMENT array for scatter and gather, 0 for one buffer
+ static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
+     uint32_t h = a[0], event = a[1], apc = a[2], apc_ctx = a[3], iosb = a[4], buf = a[5], len = a[6], off = a[7];
+@@ -551,6 +576,11 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
+     f->pos = pos + n;
+     if (write && n < len) return Finish(*f, 0xC000007F, n, event, apc, apc_ctx, iosb);  // disk full
+     if (!write && len && !n) return Finish(*f, kEndOfFile, 0, event, apc, apc_ctx, iosb);
++    if (!write && !pages && !f->entry && n >= 0x8000) {
++        std::lock_guard<std::mutex> notes(g_notes_lock);
++        g_notes.push_back({buf, n, pos, f->host.string()});
++        if (g_notes.size() > 64) g_notes.pop_front();
++    }
+     return Finish(*f, kSuccess, n, event, apc, apc_ctx, iosb);
+ }
+ 
+diff --git a/runtime/xdk/dsound.cpp b/runtime/xdk/dsound.cpp
+index 75f3e84..1d84559 100644
+--- a/runtime/xdk/dsound.cpp
++++ b/runtime/xdk/dsound.cpp
+@@ -1,11 +1,16 @@
+ // DirectSound (XDK 5849) on a host software mixer. Buffers and streams are read from guest memory as they play.
++#include <string>
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
+ #include <cmath>
+ #include <condition_variable>
+ #include <deque>
++#include <filesystem>
++#include <fstream>
++#include <list>
+ #include <map>
++#include <memory>
+ #include <vector>
+ 
+ #include "audio/audio.h"
+@@ -15,6 +20,10 @@
+ 
+ using namespace kernel;
+ 
++namespace kernel {
++bool FindRead(uint32_t at, uint32_t size, std::string& path, uint64_t& pos);  // kernel/files.cpp
++}
++
+ namespace kernel {
+ extern const xbe::Image* g_image;
+ }
+@@ -110,6 +119,21 @@ struct Voice {
+     // stream
+     uint32_t max_packets = 1, callback = 0, context = 0;
+     std::deque<Packet> packets;
++    // where the song was: the game builds a stream again from the song's start after its pause menu, so the packets
++    // the old one had taken are completed again at once and the song goes on from there
++    uint32_t first_hash = 0, consumed = 0, skip = 0;
++    bool has_first = false, was_paused = false;
++    // the radio picks another song after the pause menu: every packet a stream took is kept, and the song that was
++    // stopped is played again from there in place of the one the game fed
++    std::shared_ptr<std::vector<std::vector<uint8_t>>> cache;
++    bool pause_music = false, candidate = false, sub = false;
++    // where the song is in the game's files: its packets are read one after the other from src_off
++    bool src_ok = false;
++    std::string src;
++    uint64_t src_off = 0;
++    uint32_t src_size = 0;
++    uint32_t sub_slots[8] = {}, sub_ring = 0, sub_next = 0;
++    std::vector<uint32_t> ghost_blocks;
+     // levels
+     float volume = 1, headroom = 1;
+     uint8_t nbins = 0, bin[8] = {};
+@@ -123,12 +147,32 @@ struct Voice {
+     int16_t decoded[65 * 8];
+ };
+ 
++struct Resume {
++    uint32_t consumed;
++    std::chrono::steady_clock::time_point at;
++    std::shared_ptr<std::vector<std::vector<uint8_t>>> cache;
++    uint16_t tag, channels;
++    uint32_t rate;
++    bool src_ok;
++    std::string src;
++    uint64_t src_off;
++    uint32_t src_size;
++};
++std::map<uint32_t, Resume> g_resume;  // by the hash of a song's first packet
++uint32_t g_last_key = 0;              // the song stopped last
++// 1: the game is to make the pause menu's music, 2: that is playing, 3: the next stream is the song coming back
++int g_after_pause = 0;
++std::chrono::steady_clock::time_point g_after_pause_at;
++
+ struct Done {
+     uint32_t voice, callback, context, packet_context, status;
+ };
+ 
+ std::recursive_mutex g_lock;
+ std::map<uint32_t, Voice> g_voices;
++// A stream the game let go of with its last packet still playing: that packet is played out, from a copy of its data
++// (the game's buffers are the next song's at once), then the voice is gone.
++std::list<Voice> g_ghosts;
+ float g_listener[3] = {}, g_front[3] = {0, 0, 1}, g_top[3] = {0, 1, 0};
+ // Completed packets' callbacks, run as the XDK runs them: in DirectSoundDoWork on the title's thread, so they never
+ // overlap the title's own stream code. A stream flushed or released runs its own at once, before it is gone.
+@@ -211,6 +255,7 @@ void Complete(Voice& v, Packet& pk, uint32_t status) {
+         g_done_cv.notify_one();
+     } else if (pk.context) {
+         if (ObjectRef e = FromHandle(pk.context)) SetEvent(*e);
++        else LOG_FIRST(200, "dsound: stream %08X packet context %08X is not an event: nobody is told it finished", v.obj, pk.context);
+     }
+ }
+ 
+@@ -268,8 +313,8 @@ void Deactivate(Voice& v) {
+ void Render(float* out, uint32_t frames) {
+     std::memset(out, 0, frames * 2 * sizeof(float));
+     std::lock_guard<std::recursive_mutex> lock(g_lock);
+-    for (auto& [obj, v] : g_voices) {
+-        if (v.paused || v.sync || (!v.stream && !v.playing)) continue;
++    auto mix = [&](Voice& v) {
++        if (v.paused || v.sync || (!v.stream && !v.playing)) return;
+         float g[2][2];
+         Levels(v, g);
+         uint32_t base = v.data + v.play_start;
+@@ -283,6 +328,7 @@ void Render(float* out, uint32_t frames) {
+                     v.packets.pop_front();
+                     pk.used = pk.size;
+                     Complete(v, pk, 0);
++                    v.consumed++;
+                     v.pos -= FramesOf(v, pk.size);
+                     f = uint32_t(v.pos);
+                 }
+@@ -330,6 +376,16 @@ void Render(float* out, uint32_t frames) {
+             out[i * 2 + 1] += a * g[0][1] + b * g[1][1];
+             v.pos += step;
+         }
++    };
++    for (auto& [obj, v] : g_voices) mix(v);
++    for (auto it = g_ghosts.begin(); it != g_ghosts.end();) {
++        mix(*it);
++        if (it->packets.empty()) {
++            for (uint32_t blk : it->ghost_blocks) mem::FreeSystem(blk);
++            it = g_ghosts.erase(it);
++        } else {
++            ++it;
++        }
+     }
+     for (uint32_t i = 0; i < frames * 2; i++) out[i] = std::clamp(out[i], -1.0f, 1.0f);
+     // Mixer-side proof: peak of what was just mixed, plus a throttled census.
+@@ -350,6 +406,16 @@ void Render(float* out, uint32_t frames) {
+              (unsigned long long)g_stat_completed, (unsigned long long)g_stat_plays,
+              (unsigned long long)g_stat_setdata, (unsigned long long)g_stat_getstatus, g_stat_peak);
+         g_stat_peak = 0.0f;
++        // every stream: queued packets, active, paused, held for sync, ending, references
++        std::string streams;
++        for (auto& [obj, v] : g_voices) {
++            if (!v.stream) continue;
++            char one[64];
++            std::snprintf(one, sizeof one, " %08X:q%u%s%s%s%s r%d", obj, unsigned(v.packets.size()), v.active ? "A" : "", v.paused ? "P" : "",
++                          v.sync ? "S" : "", v.ending ? "E" : "", v.refs);
++            streams += one;
++        }
++        LOGI("dsound: streams:%s", streams.c_str());
+     }
+ }
+ 
+@@ -816,11 +882,53 @@ HLE_STDCALL(DirectSoundCreateStream, 2) {
+     v.is3d = flags & 0x10;  // DSBCAPS_CTRL3D
+     v.headroom = DefaultHeadroom(flags);
+     g_stat_streams++;
++    if (std::chrono::steady_clock::now() - g_after_pause_at > std::chrono::minutes(30)) g_after_pause = 0;
++    if (g_after_pause == 1) {
++        v.pause_music = true;
++        g_after_pause = 2;
++    } else if (g_after_pause == 3) {
++        v.candidate = true;
++        g_after_pause = 0;
++    }
+     LOGI("dsound: stream #%llu obj=%08X tag=%X ch=%u rate=%u bits=%u align=%u maxpk=%u flags=%08X bins=%u cb=%08X", (unsigned long long)g_stat_streams, obj, v.tag, v.channels, v.rate, v.bits, v.align, v.max_packets, flags, v.nbins, v.callback);
+     W32(a[1], obj);
+     return 0;
+ }
+ 
++// A wave bank (XWB, the game's audiostr.xwb) holds every song one after the other, and a song's packets are read on
++// from where it starts. Where the song stops is in the bank's table of entries: each one is a play region, an offset
++// from the start of the wave data and a length.
++struct BankEntry {
++    uint64_t begin, end;  // in the file
++};
++std::map<std::string, std::vector<BankEntry>> g_banks;
++
++static uint64_t SongEnd(const std::string& path, uint64_t at) {
++    auto it = g_banks.find(path);
++    if (it == g_banks.end()) {
++        std::vector<BankEntry> list;
++        std::ifstream in(std::filesystem::path(path), std::ios::binary);
++        std::vector<uint8_t> h(0x2000);
++        in.read(reinterpret_cast<char*>(h.data()), std::streamsize(h.size()));
++        h.resize(size_t(in.gcount()));
++        auto u32 = [&](size_t o) { return o + 4 <= h.size() ? uint32_t(h[o]) | uint32_t(h[o + 1]) << 8 | uint32_t(h[o + 2]) << 16 | uint32_t(h[o + 3]) << 24 : 0u; };
++        if (h.size() > 0x60 && std::memcmp(h.data(), "WBND", 4) == 0 && u32(4) == 2) {
++            const uint32_t bank = u32(8), meta = u32(16), wave = u32(32);
++            const uint32_t count = u32(bank + 4), size = u32(bank + 0x18);
++            for (uint32_t i = 0; i < count && size >= 16; i++) {
++                const size_t e = size_t(meta) + size_t(i) * size;
++                if (e + 16 > h.size()) break;
++                list.push_back({uint64_t(wave) + u32(e + 8), uint64_t(wave) + u32(e + 8) + u32(e + 12)});
++            }
++        }
++        LOGI("dsound: wave bank %s: %u entries", path.c_str(), unsigned(list.size()));
++        it = g_banks.emplace(path, std::move(list)).first;
++    }
++    for (const BankEntry& e : it->second)
++        if (at >= e.begin && at < e.end) return e.end;
++    return 0;
++}
++
+ #define STREAM(name, nargs)                                     \
+     static uint32_t str_##name(Voice& v, const Args& a);        \
+     HLE_STDCALL(CDirectSoundStream_##name, nargs) {             \
+@@ -855,6 +963,7 @@ static void FlushStream(Voice& v) {
+ 
+ STREAM(AddRef, 1) { return uint32_t(++v.refs); }
+ STREAM(SetFormat, 2) {
++    LOG_FIRST(3000, "dsound: stream %08X SetFormat, queued=%u", v.obj, unsigned(v.packets.size()));
+     FlushStream(v);
+     ReadFormat(v, a[1]);
+     v.freq = 0;  // the XDK sets the pitch back to the new format's own rate
+@@ -862,8 +971,38 @@ STREAM(SetFormat, 2) {
+     return 0;
+ }
+ STREAM(Release, 1) {
++    LOG_FIRST(3000, "dsound: stream %08X Release, refs now %d, queued=%u", v.obj, v.refs - 1, unsigned(v.packets.size()));
+     if (--v.refs > 0) return uint32_t(v.refs);
++    if (v.pause_music && g_after_pause == 2) g_after_pause = 3;
++    // let go on its last packet, not by the pause menu: that packet is let play out
++    if (v.stream && !v.was_paused && !v.paused && v.packets.size() == 1) {
++        Voice g = v;
++        g.callback = 0;
++        g.context = 0;
++        g.refs = 0;
++        g.block = -1;
++        g.cache.reset();
++        for (uint32_t& slot : g.sub_slots) slot = 0;
++        for (Packet& pk : g.packets) {
++            const uint32_t blk = mem::AllocSystem(pk.size);
++            std::memcpy(HostPtr(blk), HostPtr(pk.data), pk.size);
++            pk.data = blk;
++            pk.completed_ptr = pk.status_ptr = pk.context = 0;
++            g.ghost_blocks.push_back(blk);
++        }
++        g_ghosts.push_back(std::move(g));
++    }
++    if (v.was_paused && v.has_first && v.cache && !v.cache->empty()) {
++        g_resume.clear();
++        g_resume[v.first_hash] = {v.consumed, std::chrono::steady_clock::now(), v.cache, v.tag, v.channels, v.rate, v.src_ok, v.src, v.src_off, v.src_size};
++        g_last_key = v.first_hash;
++        g_after_pause = 1;
++        g_after_pause_at = std::chrono::steady_clock::now();
++        LOGI("dsound: stream %08X was stopped by the pause menu after %u packets, kept for the restart", v.obj, v.consumed);
++    }
+     FlushStream(v);
++    for (uint32_t slot : v.sub_slots)
++        if (slot) mem::FreeSystem(slot);
+     uint32_t obj = v.obj;
+     g_voices.erase(obj);
+     mem::FreeSystem(obj);
+@@ -888,29 +1027,118 @@ STREAM(Process, 3) {
+     Packet pk{R32(in), R32(in + 4), R32(in + 8), R32(in + 12), R32(in + 16)};
+     g_stat_process++;
+     g_stat_process_bytes += pk.size;
+-    LOG_FIRST(24, "dsound: process #%llu obj=%08X data=%08X size=%u tag=%X ch=%u rate=%u queued=%u", (unsigned long long)g_stat_process, v.obj, pk.data, pk.size, v.tag, v.channels, v.rate, unsigned(v.packets.size()) + 1);
++    uint32_t fp = 2166136261u; { const uint8_t* hp = static_cast<const uint8_t*>(HostPtr(pk.data)); for (uint32_t i = 0; i < pk.size; i++) fp = (fp ^ hp[i]) * 16777619u; }
++    LOG_FIRST(4000, "dsound: process #%llu obj=%08X data=%08X size=%u tag=%X ch=%u rate=%u queued=%u hash=%08X", (unsigned long long)g_stat_process, v.obj, pk.data, pk.size, v.tag, v.channels, v.rate, unsigned(v.packets.size()) + 1, fp);
+     if (pk.completed_ptr) W32(pk.completed_ptr, 0);
+     if (pk.status_ptr) W32(pk.status_ptr, kPacketPending);
++    if (!v.sub) {
++        if (!v.cache) v.cache = std::make_shared<std::vector<std::vector<uint8_t>>>();
++        std::string path;
++        uint64_t pos = 0;
++        const bool found = kernel::FindRead(pk.data, pk.size, path, pos);
++        const size_t index = v.cache->size();
++        if (index == 0) {
++            v.src_ok = found;
++            v.src = path;
++            v.src_off = pos;
++            v.src_size = pk.size;
++            LOGI("dsound: stream %08X first packet is %s from %s at %llu", v.obj, found ? "read" : "not read", found ? path.c_str() : "?", (unsigned long long)pos);
++        } else if (v.src_ok && (!found || path != v.src || pk.size != v.src_size || pos != v.src_off + index * v.src_size)) {
++            v.src_ok = false;
++            LOGI("dsound: stream %08X packet %u does not follow the one before in the file", v.obj, unsigned(index));
++        }
++        if (v.cache->size() < 800) {
++            const uint8_t* hp = static_cast<const uint8_t*>(HostPtr(pk.data));
++            v.cache->emplace_back(hp, hp + pk.size);
++        }
++    }
++    if (!v.has_first) {
++        v.has_first = true;
++        v.first_hash = fp;
++        auto it = g_resume.find(fp);
++        if (it != g_resume.end()) {
++            if (std::chrono::steady_clock::now() - it->second.at < std::chrono::minutes(30)) {
++                v.skip = it->second.consumed;
++                LOGI("dsound: stream %08X is a song stopped by the pause menu: skipping its first %u packets", v.obj, v.skip);
++            }
++            g_resume.erase(it);
++        } else if (v.candidate) {
++            auto old = g_resume.find(g_last_key);
++            if (old != g_resume.end() && old->second.cache && (old->second.src_ok || old->second.consumed < old->second.cache->size()) &&
++                old->second.tag == v.tag && old->second.channels == v.channels && old->second.rate == v.rate &&
++                std::chrono::steady_clock::now() - old->second.at < std::chrono::minutes(30)) {
++                v.sub = true;
++                v.cache = old->second.cache;
++                v.first_hash = g_last_key;
++                v.sub_next = v.consumed = old->second.consumed;
++                v.src_ok = old->second.src_ok;
++                v.src = old->second.src;
++                v.src_off = old->second.src_off;
++                v.src_size = old->second.src_size;
++                LOGI("dsound: stream %08X is another song after the pause menu: playing the stopped one again from packet %u of %u", v.obj, v.sub_next, unsigned(v.cache->size()));
++                g_resume.erase(old);
++            }
++        }
++    }
++    if (v.sub) {
++        // the stopped song's next packet: kept, or read from the game's file where the old stream left off
++        std::vector<uint8_t> got;
++        if (v.sub_next < v.cache->size()) {
++            got = (*v.cache)[v.sub_next];
++        } else if (v.src_ok && v.src_size) {
++            const uint64_t at = v.src_off + uint64_t(v.sub_next) * v.src_size, end = SongEnd(v.src, v.src_off);
++            if (end > at) {
++                std::ifstream in(std::filesystem::path(v.src), std::ios::binary);
++                got.resize(size_t(std::min<uint64_t>(v.src_size, end - at)));
++                in.seekg(std::streamoff(at));
++                in.read(reinterpret_cast<char*>(got.data()), std::streamsize(got.size()));
++                got.resize(size_t(std::max<std::streamsize>(in.gcount(), 0)));
++            }
++        }
++        if (got.empty()) {  // the stopped song is over: let the game's own run out quickly
++            v.consumed++;
++            Complete(v, pk, 0);
++            return 0;
++        }
++        v.sub_next++;
++        if (!v.sub_slots[0])
++            for (uint32_t& slot : v.sub_slots) slot = mem::AllocSystem(std::max<uint32_t>(pk.size, 0x40000));
++        const uint32_t slot = v.sub_slots[v.sub_ring++ % 8];
++        std::memset(HostPtr(slot), 0, pk.size);
++        std::memcpy(HostPtr(slot), got.data(), std::min<size_t>(got.size(), pk.size));
++        pk.data = slot;
++    }
++    if (v.skip > 0) {
++        v.skip--;
++        v.consumed++;
++        Complete(v, pk, 0);
++        return 0;
++    }
+     v.packets.push_back(pk);
+     v.active = true;
+     v.ending = false;
+     return 0;
+ }
+ STREAM(Discontinuity, 1) {
++    LOG_FIRST(3000, "dsound: stream %08X Discontinuity, queued=%u active=%d", v.obj, unsigned(v.packets.size()), int(v.active));
+     if (!v.packets.empty()) v.ending = true;
+     else if (v.active) FlushStream(v);
+     return 0;
+ }
+ STREAM(Flush, 1) {
++    LOG_FIRST(3000, "dsound: stream %08X Flush, queued=%u active=%d", v.obj, unsigned(v.packets.size()), int(v.active));
+     FlushStream(v);
+     return 0;
+ }
+ STREAM(FlushEx, 4) {
++    LOG_FIRST(3000, "dsound: stream %08X FlushEx(%u,%u,%u), queued=%u active=%d", v.obj, a[1], a[2], a[3], unsigned(v.packets.size()), int(v.active));
+     if (a[3] && !v.active) return 0;
+     FlushStream(v);
+     return 0;
+ }
+ STREAM(Pause, 2) {
++    LOG_FIRST(3000, "dsound: stream %08X Pause(%u), queued=%u", v.obj, a[1], unsigned(v.packets.size()));
++    v.was_paused = a[1] == 1;
+     v.paused = a[1] == 1;
+     v.sync = a[1] == 2;
+     return 0;

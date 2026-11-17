@@ -425,3 +425,21 @@ in the capture pinned it. `SetRenderTarget` now clears the scissors, as
 Not yet run on Linux: the Vulkan side of defects 5 and 6 passes a syntax-only
 compile of `vulkan.cpp` on its Linux path. Still open: ambient sound lost after
 travelling to a third location (not yet reproducible).
+
+### Left stick in menus, friendship decay, radio after the pause menu (2026-11-16)
+
+The left stick gets the D-pad's press shaping (`ShapeStick` in `src/common/dpad_shape.cpp`): the game
+turns the stick into held bits at pad+0x200 → +0x08 (up 0x10000, right 0x20000, down 0x40000, left
+0x80000), which are pulsed, repeated and kept to one axis after `sub_001BCA50`. Confirmed in play by the
+owner. `src/common/friend_decay.cpp` finds the "decay relationships" behavior script in guest memory
+(a `BHAV`, the name 12 bytes in) and makes its first node return true, or lets it through for a share of
+each second (the speed slider). Stopping it was confirmed in play; the slider's average rate has not been
+measured over a long run, and a second decay script may exist that this does not touch.
+
+The pause menu releases the song stream and builds a new one from the start of `audiostr.xwb`, and a
+radio station builds one for a different song. `patches/sdk/0006` keeps what the stopped stream had
+taken and carries on from there: the same song skips its played packets, a different one is replaced by
+the stopped song, read from the wave bank to its entry's end. Confirmed in play for single songs and
+radio. Not fixed: pressing "next song" can repeat the same two songs (the log shows the game choosing
+them with none of this code involved), the "now playing" banner has not been seen, and the late-session
+audio loss is not understood.
