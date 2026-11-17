@@ -5,6 +5,7 @@
 #include "common/overlay.h"
 
 #include "common/dpad_shape.h"
+#include "common/friend_decay.h"
 #include "common/game_options.h"
 #include "common/input_kbm.h"
 #include "common/input_trace.h"
@@ -574,6 +575,15 @@ void DrawSettings() {
         std::snprintf(text, sizeof text, "A held button repeats after %d ms, then every %d ms. Higher is slower.",
                       10 * 1000 * repeat / 6000, 3 * 1000 * repeat / 6000);
         Note(text);
+        Row("Stop friendship decay");
+        ImGui::Checkbox("##frienddecaystop", &frienddecay::Stopped());
+        Note("Friendships stay as they are when a Sim is not talked to. Only the copy of the game's decay script in memory is changed.");
+        Row("Friendship decay speed");
+        int decay = int(frienddecay::Percent());
+        if (ImGui::SliderInt("##frienddecay", &decay, int(frienddecay::kMin), int(frienddecay::kMax), "%d %%",
+                             ImGuiSliderFlags_AlwaysClamp))
+            frienddecay::Percent() = uint32_t((decay + 2) / 5 * 5);
+        Note("How much of the game's own decay happens: 100 is normal, 50 lets half of the decay days through. Needs a loaded game.");
         ImGui::EndTable();
     }
     ImGui::SeparatorText("Cheats");

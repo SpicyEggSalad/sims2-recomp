@@ -5,6 +5,7 @@
 // is before the game reads them.
 #include "common/game_options.h"
 #include "common/dpad_shape.h"
+#include "common/friend_decay.h"
 
 #include <cstring>
 #include <iterator>
@@ -58,6 +59,8 @@ std::vector<app::Option> Options() {
     out.push_back({"dpad_repeat_percent", nullptr, &RepeatPercent()});
     out.push_back({"dpad_shape", &dpadshape::On(), nullptr});
     out.push_back({"stick_shape", &dpadshape::StickOn(), nullptr});
+    out.push_back({"friend_decay_stop", &frienddecay::Stopped(), nullptr});
+    out.push_back({"friend_decay_percent", nullptr, &frienddecay::Percent()});
     return out;
 }
 

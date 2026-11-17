@@ -34,6 +34,7 @@
 #include <mutex>
 
 #include "common/dpad_shape.h"
+#include "common/friend_decay.h"
 #include "common/game_options.h"
 #include "common/input_trace.h"
 #include "core/log.h"
@@ -107,6 +108,7 @@ X86_FUNC(sub_001C2400) {
     ctx.eax = uint32_t(ticks);
     g_dt.store(dt, std::memory_order_relaxed);
     dpadshape::FrameStep(dt);
+    frienddecay::Tick();
     ctx.esp += 8;  // ret 4
 }
 
