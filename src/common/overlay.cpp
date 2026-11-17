@@ -561,6 +561,10 @@ void DrawSettings() {
         ImGui::Checkbox("##dpadshape", &dpadshape::On());
         Note("Each D-pad press reaches the game for two ticks, as on the console, so one tap is one menu step; "
              "holding repeats at the delay below.");
+        Row("Left stick taps");
+        ImGui::Checkbox("##stickshape", &dpadshape::StickOn());
+        Note("The same for the left stick in menus: a tap is one step, a lean to a corner picks the side it leans to. "
+             "The cursor still moves smoothly.");
         Row("D-pad repeat delay");
         int repeat = int(gameopt::RepeatPercent());
         if (ImGui::SliderInt("##repeat", &repeat, int(gameopt::kRepeatMin), int(gameopt::kRepeatMax), "%d %%",

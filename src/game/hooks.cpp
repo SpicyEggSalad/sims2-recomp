@@ -185,6 +185,20 @@ X86_FUNC(sub_001BCA50) {
     __imp__sub_001BCA50(ctx, base);
     X86_MEM8(pad + 0x1D8u) = delay;
     X86_MEM8(pad + 0x1D9u) = rate;
+    // the stick's held bits, pulsed like the D-pad taps (common/dpad_shape.h); the analog values are not touched
+    if (const uint32_t obj = X86_MEM32(pad + 0x200u); obj >= 0x10000u) {
+        const uint32_t held = X86_MEM32(obj + 0x08u);
+        uint32_t started = 0;
+        const uint32_t shaped = dpadshape::ShapeStick(pad, held, &started);
+        if (started) X86_MEM32(pad + 0x1B4u) |= started;  // the menus' press word: a repeat is a press from here
+        if (shaped != held) {
+            constexpr uint32_t m = dpadshape::kStickBits;
+            const uint32_t gone = (held ^ shaped) & m;  // bits the pulse took away
+            X86_MEM32(obj + 0x08u) = shaped;
+            X86_MEM32(obj + 0x18u) &= ~gone;
+            X86_MEM32(pad + 0x1B4u) &= ~gone;
+        }
+    }
     if (inputtrace::On()) TracePad(pad, base);
 }
 

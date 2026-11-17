@@ -57,6 +57,7 @@ std::vector<app::Option> Options() {
     EachManaged([&](Managed& m) { out.push_back({m.key, &m.on, nullptr}); });
     out.push_back({"dpad_repeat_percent", nullptr, &RepeatPercent()});
     out.push_back({"dpad_shape", &dpadshape::On(), nullptr});
+    out.push_back({"stick_shape", &dpadshape::StickOn(), nullptr});
     return out;
 }
 
