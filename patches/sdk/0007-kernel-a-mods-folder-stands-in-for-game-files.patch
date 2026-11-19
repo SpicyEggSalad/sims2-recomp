@@ -1,0 +1,69 @@
+From 454437a4723aeee2e2a4fbf9505f9756741b9d3a Mon Sep 17 00:00:00 2001
+From: SpicyEggSalad <177426835+SpicyEggSalad@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 02:44:15 +0000
+Subject: [PATCH] kernel: a mods folder stands in for game files
+
+A file in a "mods" folder beside the hdd folder is opened in place of the game file
+of the same path on the game disc (D:), matched without regard to case. Only a file
+that is there is taken over; folders are listed as the game has them, and a file the
+game never opens is never read. The original files are not touched.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ runtime/kernel/files.cpp | 28 ++++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/runtime/kernel/files.cpp b/runtime/kernel/files.cpp
+index ad2ed6d..c5aa7e9 100644
+--- a/runtime/kernel/files.cpp
++++ b/runtime/kernel/files.cpp
+@@ -248,7 +248,19 @@ std::string ReadCString(uint32_t va, size_t max) {
+     return s;
+ }
+ 
++namespace {
++fs::path& ModsDir();
++}
++
+ void MountDefaults(const std::string& game_dir, const std::string& data_dir) {
++    {
++        std::error_code ec;
++        fs::path mods = fs::path(data_dir).parent_path() / "mods";
++        if (fs::is_directory(mods, ec)) {
++            ModsDir() = mods;
++            LOGI("files: mods folder %s", mods.string().c_str());
++        }
++    }
+     std::lock_guard<std::mutex> lock(g_links_lock);
+     fs::path d = data_dir;
+     g_devices[kCdRom] = game_dir;
+@@ -286,6 +298,14 @@ std::string QuerySymbolicLink(const std::string& link) {
+ 
+ namespace {
+ 
++// A "mods" folder beside the "hdd" folder: a file in it stands in for the game file of the same path on the game
++// disc (D:), so a player can replace a data archive, a wave bank or a movie without touching the game's own files.
++// Only a file that is there is taken over; folders are listed as the game has them.
++fs::path& ModsDir() {
++    static fs::path dir;
++    return dir;
++}
++
+ struct Target {
+     std::string host;                    // empty on the disc image or unmapped
+     bool disc = false;                   // on the mounted disc image
+@@ -329,6 +349,14 @@ Target Resolve(const std::string& xbox_path, uint32_t root_handle) {
+     // no Xbox name holds ':', and fs::path would take "D:" as a host drive
+     for (auto& part : parts)
+         if (part.find(':') != std::string::npos) return {};
++    if (best->first == kCdRom && !ModsDir().empty() && !parts.empty()) {
++        fs::path m = MatchCase(ModsDir(), parts);
++        std::error_code ec;
++        if (fs::is_regular_file(m, ec)) {
++            LOG_FIRST(200, "mods: %s stands in for %s", m.string().c_str(), p.c_str());
++            return {m.string()};
++        }
++    }
+     if (best->first == kCdRom)
+         if (const Disc* disc = MountedDisc()) return {{}, true, disc->Find(parts)};
+     return {MatchCase(best->second, parts).string()};

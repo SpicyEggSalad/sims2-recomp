@@ -83,6 +83,18 @@ Keys are read only while the game window has focus, and are dropped when it lose
 alt-tabbed game does not walk on by itself. While the F1 settings panel is up it owns the keyboard
 and the mouse and the game sees neither.
 
+## Mods
+
+Make a folder called `mods` beside `Sims2.exe` (next to the `hdd` and `assets` folders). A file in
+it stands in for the game file with the same path on the game disc, so a data archive, a wave bank
+or a movie can be replaced without touching the original files. For example,
+`mods\DATA\soundtra.arc` is read instead of the game's `DATA\soundtra.arc`. Upper and lower case
+do not matter. The log (`XBE_LOG=1`) shows each file taken over as `mods: ... stands in for ...`.
+
+A replacement has to be a whole file, and only a file the game already opens can be replaced: a
+new file the game does not ask for is never read. The game's own files stay as they are, so
+deleting the folder, or a file in it, puts the original back.
+
 ## Status
 
 | Stage | State |
