@@ -578,6 +578,12 @@ void DrawSettings() {
         Row("Stop friendship decay");
         ImGui::Checkbox("##frienddecaystop", &frienddecay::Stopped());
         Note("Friendships stay as they are when a Sim is not talked to. Only the copy of the game's decay script in memory is changed.");
+        Row("Fast-forward speed (R2)");
+        int ff = int(gameopt::FastForward());
+        if (ImGui::SliderInt("##fastforward", &ff, int(gameopt::kFastMin), int(gameopt::kFastMax), "x%d",
+                             ImGuiSliderFlags_AlwaysClamp))
+            gameopt::FastForward() = uint32_t(ff);
+        Note("How fast time runs while R2 is held: 5 is the game's own, 30 is the speed it picks by itself when every Sim is at work or asleep. Sims that are awake may behave oddly at the high end.");
         Row("Friendship decay speed");
         int decay = int(frienddecay::Percent());
         if (ImGui::SliderInt("##frienddecay", &decay, int(frienddecay::kMin), int(frienddecay::kMax), "%d %%",

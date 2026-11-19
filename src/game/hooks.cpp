@@ -257,3 +257,15 @@ X86_FUNC(sub_001BCA50) {
 //    at pad+0x1B4 produced by the wrapped sub_001BCA50 above. Wrapping any of these by
 //    analogy would be inventing a consumer; measure first (units/second at two caps, same
 //    scene) and wrap only what measurably scales with frame rate.
+
+// Time speed. The controller (sub_00111250, once a frame) hands a signed speed to the clock object, whose
+// sub_000F0AC0 turns it into the time scale at this+0xA4 (this in esi): speed 0 is 1.0, 0xFE (holding R2) 5.0,
+// 0xFD (picked by the game when no Sim needs attention) 30.0, and 0 while paused. Seen in play: R2 gave target FE,
+// every Sim at work or asleep gave FD. When the player has set another speed for R2 it replaces the 5.0.
+X86_FUNC(__imp__sub_000F0AC0);
+X86_FUNC(sub_000F0AC0) {
+    const uint32_t obj = ctx.esi;
+    __imp__sub_000F0AC0(ctx, base);
+    const uint32_t speed = gameopt::FastForward();
+    if (speed != 5u && X86_MEMF32(obj + 0xA4u) == 5.0f) X86_MEMF32(obj + 0xA4u) = float(speed);
+}

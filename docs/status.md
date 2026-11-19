@@ -443,3 +443,15 @@ the stopped song, read from the wave bank to its entry's end. Confirmed in play 
 radio. Not fixed: pressing "next song" can repeat the same two songs (the log shows the game choosing
 them with none of this code involved), the "now playing" banner has not been seen, and the late-session
 audio loss is not understood.
+
+### Fast-forward speed (2026-11-18)
+
+The game's speed controller (`sub_00111250`, once a frame, this in `edi`) keeps the speed it wants at
+this+0xF3: 0 normal, 0xFC paused, 0xFE holding R2, 0xFD the faster one the game picks itself when no Sim
+needs attention (every Sim at work or asleep); seen in play from a log of the target changing. The clock
+object's `sub_000F0AC0` turns the speed into the time scale at this+0xA4 through a four-entry table:
+x1 for speed 0, x5 for 0xFE, x30 for 0xFD (floats at 0x316248, 0x316334, 0x316480 of the image). The hook
+in `src/game/hooks.cpp` replaces the 5.0 with the player's value (`fast_forward_speed` in the settings file,
+5 to 30, the F1 panel's "Fast-forward speed (R2)"), so R2 can reach the game's own highest speed. The owner
+ran it up to x30 and felt the difference. How Sims that are awake behave at the high end has not been
+measured; the panel says they may behave oddly.

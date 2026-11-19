@@ -33,6 +33,11 @@ std::vector<app::Option> Options();
 constexpr uint32_t kRepeatMin = 100, kRepeatMax = 400;
 uint32_t& RepeatPercent();
 
+// The speed holding R2 gives, as a multiple of normal time. The game's own is 5; the one it picks by itself when
+// nobody needs attention (every Sim at work or asleep) is 30. src/game/hooks.cpp sub_000F0AC0 applies it.
+constexpr uint32_t kFastMin = 5, kFastMax = 30;
+uint32_t& FastForward();
+
 // guest thread, from the registration hook: the game registered name (type 2 is on/off) for the byte at var
 void Register(const char* name, const char* desc, uint32_t type, uint8_t* var);
 

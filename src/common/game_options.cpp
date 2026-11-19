@@ -48,6 +48,11 @@ void EachManaged(F f) {
 
 }  // namespace
 
+uint32_t& FastForward() {
+    static uint32_t v = kFastMin;
+    return v;
+}
+
 uint32_t& RepeatPercent() {
     static uint32_t percent = 200;
     return percent;
@@ -59,6 +64,7 @@ std::vector<app::Option> Options() {
     out.push_back({"dpad_repeat_percent", nullptr, &RepeatPercent()});
     out.push_back({"dpad_shape", &dpadshape::On(), nullptr});
     out.push_back({"stick_shape", &dpadshape::StickOn(), nullptr});
+    out.push_back({"fast_forward_speed", nullptr, &FastForward()});
     out.push_back({"friend_decay_stop", &frienddecay::Stopped(), nullptr});
     out.push_back({"friend_decay_percent", nullptr, &frienddecay::Percent()});
     return out;
