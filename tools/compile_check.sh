@@ -20,10 +20,10 @@ INC=(-I src -I sdk/runtime -isystem "$IMGUI" -isystem "$TOML/include")
 for d in ${SDL_INC:-}; do INC+=(-isystem "$d"); done
 
 # in no build of this platform, or needing the game's generated headers
-SKIP=" main.cpp game_files.cpp system_info.cpp "
+SKIP=" main.cpp main_sdl.cpp game_files.cpp system_info.cpp "
 case "$(uname -s)" in
     Linux*) SKIP+="d3d12.cpp xaudio2.cpp " ;;                                          # Windows only
-    *) SKIP+="main_sdl.cpp vulkan.cpp spirv.cpp sdl_audio.cpp image_decode.cpp " ;;    # Linux only
+    *) SKIP+="vulkan.cpp spirv.cpp sdl_audio.cpp image_decode.cpp " ;;    # Linux only
 esac
 [ -n "${SDL_INC:-}" ] || SKIP+="input.cpp "
 
