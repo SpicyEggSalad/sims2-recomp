@@ -20,7 +20,7 @@ jobs:
         run: |
           git -C sdk config user.name ci
           git -C sdk config user.email ci@example.invalid
-          git -C sdk am --3way ../patches/sdk/*.patch
+          git -C sdk am --3way "$GITHUB_WORKSPACE"/patches/sdk/*.patch
 
       - name: Install tools
         run: |
