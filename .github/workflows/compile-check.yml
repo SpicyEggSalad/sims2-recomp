@@ -32,8 +32,6 @@ jobs:
           git clone --depth 1 --branch v1.91.9b https://github.com/ocornut/imgui.git ../imgui
           git clone --depth 1 --branch v3.4.0 https://github.com/marzer/tomlplusplus.git ../tomlplusplus
           git clone --depth 1 --branch release-3.4.16 https://github.com/libsdl-org/SDL.git ../SDL
-          # configure only: it writes SDL_revision.h, which the headers include
-          cmake -S ../SDL -B ../SDL/build -G Ninja -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF
 
       - name: Compile the host code
         run: |
