@@ -25,7 +25,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang cmake ninja-build libvulkan-dev zlib1g-dev
+          sudo apt-get install -y clang libvulkan-dev zlib1g-dev
 
       - name: Fetch the libraries the host code includes
         run: |
@@ -38,5 +38,5 @@ jobs:
       - name: Compile the host code
         run: |
           export IMGUI="$PWD/../imgui" TOML="$PWD/../tomlplusplus"
-          export SDL_INC="$PWD/../SDL/include $PWD/../SDL/build/include $PWD/../SDL/build/include-revision"
+          export SDL_INC="$PWD/../SDL/include"
           bash tools/compile_check.sh
