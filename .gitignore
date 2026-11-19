@@ -42,3 +42,18 @@ settings.toml
 # Local temporary folder
 .local
 __pycache__/
+
+# Game files, in case they end up outside /assets/ (a copied disc, an extraction, a mods folder run from here).
+# None of these may ever be committed: the repository holds no game code and no game assets.
+*.xbe
+*.xiso
+*.arc
+*.xwb
+*.xsb
+*.xmv
+*.ngh
+*.ind
+/mods/
+/textures/
+/textures_dump/
+/captures/
