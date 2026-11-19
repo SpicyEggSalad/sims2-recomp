@@ -1,0 +1,42 @@
+name: Compile check
+
+# A syntax-only compile of the host code on Linux. It needs no game files, so it cannot build the whole
+# game and cannot say the port runs: see tools/compile_check.sh for what it covers and what it leaves out.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      # the SDK submodule stays at the commit before this port's changes; they are carried as patches
+      - name: Apply the SDK patches
+        run: |
+          git -C sdk config user.name ci
+          git -C sdk config user.email ci@example.invalid
+          git -C sdk am --3way ../patches/sdk/*.patch
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build libvulkan-dev zlib1g-dev
+
+      - name: Fetch the libraries the host code includes
+        run: |
+          git clone --depth 1 --branch v1.91.9b https://github.com/ocornut/imgui.git ../imgui
+          git clone --depth 1 --branch v3.4.0 https://github.com/marzer/tomlplusplus.git ../tomlplusplus
+          git clone --depth 1 --branch release-3.4.16 https://github.com/libsdl-org/SDL.git ../SDL
+          # configure only: it writes SDL_revision.h, which the headers include
+          cmake -S ../SDL -B ../SDL/build -G Ninja -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF
+
+      - name: Compile the host code
+        run: |
+          export IMGUI="$PWD/../imgui" TOML="$PWD/../tomlplusplus"
+          export SDL_INC="$PWD/../SDL/include $PWD/../SDL/build/include $PWD/../SDL/build/include-revision"
+          bash tools/compile_check.sh
